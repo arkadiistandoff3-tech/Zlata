@@ -4,3 +4,4 @@ psutil
 Pillow
 requests
 pymongo
+eventlet
