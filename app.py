@@ -7,6 +7,7 @@ Features:
 - Neon Theme UI with dynamic color switcher
 - Password Authentication, Sessions & User Permissions
 - Real-time System Monitoring, Process Manager, File System, Camera, Remote Desktop, Troll Panel
+Zlata+Arkadii=Love
 """
 
 import os
