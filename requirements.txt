@@ -1,5 +1,6 @@
 flask
-flask-socketio
-eventlet
 gunicorn
+psutil
+Pillow
+requests
 pymongo
