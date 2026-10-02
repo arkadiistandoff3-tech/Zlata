@@ -153,30 +153,362 @@ DASHBOARD_HTML = CSS_BASE + SIDEBAR_HTML + """
 
 CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
 <style>
-    .control-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
-    @media (max-width: 1100px) { .control-grid { grid-template-columns: 1fr; } }
-    .video-container img { width: 100%; border-radius: 8px; border: 1px solid var(--neon); box-shadow: 0 0 15px rgba(0, 255, 208, 0.2); }
+    :root {
+        --neon: #00ffd0;
+        --muted: #4fbdb1;
+        --bg: #05060d;
+        --panel: rgba(11, 15, 25, 0.75);
+        --border: rgba(0, 255, 208, 0.2);
+        --border-light: rgba(255, 255, 255, 0.08);
+    }
+
+    .main-content {
+        padding: 20px;
+        color: #e2e8f0;
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+
+    .control-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 20px;
+        background: var(--panel);
+        padding: 15px 20px;
+        border-radius: 12px;
+        border: 1px solid var(--border-light);
+        backdrop-filter: blur(10px);
+    }
+
+    .control-header h2 {
+        margin: 0;
+        font-size: 20px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        color: #fff;
+    }
+
+    .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        padding: 4px 10px;
+        border-radius: 20px;
+        background: rgba(0, 255, 208, 0.1);
+        color: var(--neon);
+        border: 1px solid var(--border);
+    }
+
+    .status-dot {
+        width: 8px;
+        height: 8px;
+        background: var(--neon);
+        border-radius: 50%;
+        box-shadow: 0 0 8px var(--neon);
+        animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+        0% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.4; transform: scale(0.8); }
+        100% { opacity: 1; transform: scale(1); }
+    }
+
+    .btn-back {
+        text-decoration: none;
+        color: var(--neon);
+        font-size: 14px;
+        border: 1px solid var(--border);
+        padding: 8px 16px;
+        border-radius: 8px;
+        background: rgba(0, 255, 208, 0.05);
+        transition: all 0.2s ease;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .btn-back:hover {
+        background: var(--neon);
+        color: #000;
+        box-shadow: 0 0 15px rgba(0, 255, 208, 0.4);
+    }
+
+    .control-grid {
+        display: grid;
+        grid-template-columns: 1.4fr 1fr;
+        gap: 20px;
+    }
+
+    @media (max-width: 1100px) {
+        .control-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .card {
+        background: var(--panel);
+        border: 1px solid var(--border-light);
+        border-radius: 12px;
+        padding: 18px;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.37);
+        backdrop-filter: blur(8px);
+        display: flex;
+        flex-direction: column;
+    }
+
+    .card-title {
+        margin: 0 0 15px 0;
+        font-size: 16px;
+        font-weight: 600;
+        color: #fff;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    /* Stream Video Styling */
+    .video-container {
+        position: relative;
+    }
+
+    .video-wrapper {
+        position: relative;
+        width: 100%;
+        background: #000;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        box-shadow: 0 0 20px rgba(0, 255, 208, 0.15);
+        aspect-ratio: 16 / 9;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .video-wrapper img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+    }
+
+    .stream-overlay {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        display: flex;
+        gap: 8px;
+        z-index: 5;
+    }
+
+    .icon-btn {
+        background: rgba(0, 0, 0, 0.65);
+        border: 1px solid var(--border-light);
+        color: #fff;
+        padding: 6px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        transition: all 0.2s;
+    }
+
+    .icon-btn:hover {
+        border-color: var(--neon);
+        color: var(--neon);
+    }
+
+    .stream-footer {
+        color: #94a3b8;
+        font-size: 12px;
+        margin-top: 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    /* CMD Terminal Styling */
+    .cmd-container {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+    }
+
+    .quick-cmds {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+    }
+
+    .quick-btn {
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--border-light);
+        color: var(--muted);
+        padding: 4px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+        font-family: monospace;
+    }
+
+    .quick-btn:hover {
+        border-color: var(--neon);
+        color: var(--neon);
+        background: rgba(0, 255, 208, 0.1);
+    }
+
+    .cmd-form {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 12px;
+    }
+
+    .cmd-input {
+        flex: 1;
+        background: #020617;
+        border: 1px solid var(--border-light);
+        color: var(--neon);
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-family: 'Consolas', 'Fira Code', monospace;
+        font-size: 14px;
+        outline: none;
+        transition: border-color 0.2s;
+    }
+
+    .cmd-input:focus {
+        border-color: var(--neon);
+        box-shadow: 0 0 10px rgba(0, 255, 208, 0.2);
+    }
+
+    .cmd-submit {
+        background: rgba(0, 255, 208, 0.15);
+        border: 1px solid var(--border);
+        color: var(--neon);
+        padding: 10px 18px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: all 0.2s;
+        white-space: nowrap;
+    }
+
+    .cmd-submit:hover {
+        background: var(--neon);
+        color: #000;
+        box-shadow: 0 0 15px rgba(0, 255, 208, 0.4);
+    }
+
+    .terminal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background: #090d16;
+        padding: 8px 12px;
+        border-radius: 8px 8px 0 0;
+        border: 1px solid var(--border-light);
+        border-bottom: none;
+        font-family: monospace;
+        font-size: 12px;
+        color: #64748b;
+    }
+
+    .cmd-output {
+        flex: 1;
+        min-height: 280px;
+        max-height: 480px;
+        background: #020617;
+        color: #38edf8;
+        border: 1px solid var(--border-light);
+        border-radius: 0 0 8px 8px;
+        padding: 12px;
+        font-family: 'Consolas', 'Fira Code', 'Courier New', monospace;
+        font-size: 13px;
+        line-height: 1.5;
+        resize: vertical;
+        outline: none;
+        box-sizing: border-box;
+        box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.8);
+    }
+
+    .cmd-output::-webkit-scrollbar {
+        width: 8px;
+    }
+
+    .cmd-output::-webkit-scrollbar-track {
+        background: #020617;
+    }
+
+    .cmd-output::-webkit-scrollbar-thumb {
+        background: #1e293b;
+        border-radius: 4px;
+    }
+
+    .cmd-output::-webkit-scrollbar-thumb:hover {
+        background: var(--neon);
+    }
 </style>
+
 <div class="main-content">
-    <h2 style="margin-top: 0; border-bottom: 1px solid var(--border); padding-bottom: 10px;">
-        Термінал управління: <span style="color: #fff;">{{ pc_name }}</span>
-        <a href="/dashboard" style="float: right; font-size: 14px; border: 1px solid var(--border); padding: 5px 10px; border-radius: 5px;">Повернутися</a>
-    </h2>
-    
+    <div class="control-header">
+        <h2>
+            🖥 Термінал управління: <span style="color: var(--neon);">{{ pc_name }}</span>
+            <span class="status-badge"><span class="status-dot"></span> Online</span>
+        </h2>
+        <a href="/dashboard" class="btn-back">⬅ Повернутися</a>
+    </div>
+
     <div class="control-grid">
+        <!-- Live Stream Card -->
         <div class="card video-container">
-            <h3 style="margin-top: 0;">📺 Трансляція екрану</h3>
-            <img src="/video_feed/{{ cid }}" alt="Очікування трансляції...">
-            <p style="color: #aaa; font-size: 12px; margin-top: 10px; text-align: center;">Трансляція активна лише під час перегляду цієї сторінки.</p>
+            <div class="card-title">
+                <span>📺 Трансляція екрану</span>
+                <span style="font-size: 12px; color: var(--neon); font-weight: normal;">● LIVE</span>
+            </div>
+            
+            <div class="video-wrapper" id="videoWrapper">
+                <div class="stream-overlay">
+                    <button class="icon-btn" onclick="refreshStream()" title="Оновити потік">🔄</button>
+                    <button class="icon-btn" onclick="toggleFullscreen()" title="На весь екран">⛶</button>
+                </div>
+                <img id="streamImg" src="/video_feed/{{ cid }}" alt="Очікування трансляції..." onerror="handleStreamError(this)">
+            </div>
+            
+            <div class="stream-footer">
+                <span>⚡ Активна сесія трансляції</span>
+                <span>ID: {{ cid }}</span>
+            </div>
         </div>
-        
+
+        <!-- CMD Terminal Card -->
         <div class="card cmd-container">
-            <h3 style="margin-top: 0;">⌨️️ CMD (Командний рядок)</h3>
-            <form onsubmit="sendCommand(event)">
-                <input type="text" id="cmdInput" placeholder="Команда (dir, whoami, ipconfig...)" required autocomplete="off">
-                <button type="submit">Виконати команду</button>
+            <div class="card-title">
+                <span>⌨ CMD (Командний рядок)</span>
+                <button class="icon-btn" onclick="clearOutput()" style="font-size: 11px;">Очистити</button>
+            </div>
+
+            <!-- Quick Commands -->
+            <div class="quick-cmds">
+                <button class="quick-btn" onclick="setQuickCmd('dir')">dir</button>
+                <button class="quick-btn" onclick="setQuickCmd('whoami')">whoami</button>
+                <button class="quick-btn" onclick="setQuickCmd('ipconfig /all')">ipconfig</button>
+                <button class="quick-btn" onclick="setQuickCmd('tasklist')">tasklist</button>
+                <button class="quick-btn" onclick="setQuickCmd('netstat -an')">netstat</button>
+            </div>
+
+            <form class="cmd-form" onsubmit="sendCommand(event)">
+                <input type="text" id="cmdInput" class="cmd-input" placeholder="Введіть команду (напр. systeminfo)..." required autocomplete="off">
+                <button type="submit" class="cmd-submit">Виконати</button>
             </form>
-            <textarea id="output" readonly placeholder="Тут буде виведено результат виконання команд...">{{ output }}</textarea>
+
+            <div class="terminal-header">
+                <span>TERMINAL OUTPUT</span>
+                <span id="cmdStatus" style="color: var(--neon);">Готовий</span>
+            </div>
+            <textarea id="output" class="cmd-output" readonly placeholder="Тут буде виведено результат виконання команд...">{{ output }}</textarea>
         </div>
     </div>
 </div>
@@ -184,31 +516,81 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
 <script>
     function sendCommand(e) {
         e.preventDefault();
-        const cmd = document.getElementById('cmdInput').value;
-        
+        const input = document.getElementById('cmdInput');
+        const cmd = input.value.trim();
+        if (!cmd) return;
+
+        const status = document.getElementById('cmdStatus');
+        status.textContent = '⏳ Виконується...';
+        status.style.color = '#f59e0b';
+
         fetch('/api/send_cmd/{{ cid }}', {
             method: 'POST',
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
             body: 'command=' + encodeURIComponent(cmd)
+        }).then(r => {
+            if (r.ok) {
+                input.value = '';
+            } else {
+                status.textContent = '❌ Помилка';
+                status.style.color = '#ef4444';
+            }
+        }).catch(() => {
+            status.textContent = '❌ Помилка мережі';
+            status.style.color = '#ef4444';
         });
-        
-        document.getElementById('cmdInput').value = '';
-        document.getElementById('output').value = '⏳ Виконується...';
     }
 
+    function setQuickCmd(cmd) {
+        const input = document.getElementById('cmdInput');
+        input.value = cmd;
+        input.focus();
+    }
+
+    function clearOutput() {
+        document.getElementById('output').value = '';
+        document.getElementById('cmdStatus').textContent = 'Очищено';
+        document.getElementById('cmdStatus').style.color = 'var(--muted)';
+    }
+
+    function refreshStream() {
+        const img = document.getElementById('streamImg');
+        img.src = '/video_feed/{{ cid }}?t=' + new Date().getTime();
+    }
+
+    function handleStreamError(img) {
+        setTimeout(() => {
+            img.src = '/video_feed/{{ cid }}?t=' + new Date().getTime();
+        }, 2000);
+    }
+
+    function toggleFullscreen() {
+        const wrapper = document.getElementById('videoWrapper');
+        if (!document.fullscreenElement) {
+            wrapper.requestFullscreen().catch(err => console.log(err));
+        } else {
+            document.exitFullscreen();
+        }
+    }
+
+    let lastOutput = '';
     setInterval(() => {
         fetch('/api/get_output/{{ cid }}')
             .then(r => r.text())
-            .then(txt => { 
-                if(txt) {
+            .then(txt => {
+                if (txt && txt !== lastOutput) {
+                    lastOutput = txt;
                     const outbox = document.getElementById('output');
-                    if (outbox.value !== txt) {
-                        outbox.value = txt; 
-                        outbox.scrollTop = outbox.scrollHeight;
-                    }
+                    outbox.value = txt;
+                    outbox.scrollTop = outbox.scrollHeight;
+
+                    const status = document.getElementById('cmdStatus');
+                    status.textContent = 'Готовий';
+                    status.style.color = 'var(--neon)';
                 }
-            });
-    }, 1500);
+            })
+            .catch(() => {});
+    }, 1200);
 </script>
 """
 
