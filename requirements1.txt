@@ -1,1 +1,3 @@
-pip install requests psutil pillow
+requests
+psutil
+pillow
