@@ -166,6 +166,7 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
         padding: 20px;
         color: #e2e8f0;
         font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        /* margin-left: 260px підтягується автоматично з CSS_BASE для меню */
     }
 
     .control-header {
@@ -498,6 +499,14 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
                 <button class="quick-btn" onclick="setQuickCmd('tasklist')">tasklist</button>
                 <button class="quick-btn" onclick="setQuickCmd('netstat -an')">netstat</button>
             </div>
+            
+            <!-- Power Control Commands -->
+            <div class="quick-cmds" style="padding-top: 10px; border-top: 1px solid var(--border-light); margin-bottom: 15px;">
+                <span style="color: var(--muted); font-size: 12px; margin-right: 10px; display: flex; align-items: center;">⚡ Керування живленням:</span>
+                <button class="quick-btn" style="color: #fbbf24; border-color: rgba(251, 191, 36, 0.3);" onclick="executeDirectCmd('logoff')">🚪 Логаут</button>
+                <button class="quick-btn" style="color: #60a5fa; border-color: rgba(96, 165, 250, 0.3);" onclick="executeDirectCmd('rundll32.exe powrprof.dll,SetSuspendState 0,1,0')">🌙 Сплячий режим</button>
+                <button class="quick-btn" style="color: #ef4444; border-color: rgba(239, 68, 68, 0.3);" onclick="executeDirectCmd('shutdown /s /t 0')">⏻ Вимкнути ПК</button>
+            </div>
 
             <form class="cmd-form" onsubmit="sendCommand(event)">
                 <input type="text" id="cmdInput" class="cmd-input" placeholder="Введіть команду (напр. systeminfo)..." required autocomplete="off">
@@ -545,6 +554,32 @@ CONTROL_HTML = CSS_BASE + SIDEBAR_HTML + """
         const input = document.getElementById('cmdInput');
         input.value = cmd;
         input.focus();
+    }
+    
+    // Нова функція для миттєвого виконання команд живлення з підтвердженням
+    function executeDirectCmd(cmd) {
+        if (!confirm('Ви впевнені, що хочете виконати цю дію?')) return;
+        
+        const status = document.getElementById('cmdStatus');
+        status.textContent = '⏳ Виконується дія...';
+        status.style.color = '#f59e0b';
+
+        fetch('/api/send_cmd/{{ cid }}', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: 'command=' + encodeURIComponent(cmd)
+        }).then(r => {
+            if (r.ok) {
+                status.textContent = '✅ Команду відправлено';
+                status.style.color = 'var(--neon)';
+            } else {
+                status.textContent = '❌ Помилка відправки';
+                status.style.color = '#ef4444';
+            }
+        }).catch(() => {
+            status.textContent = '❌ Помилка мережі';
+            status.style.color = '#ef4444';
+        });
     }
 
     function clearOutput() {
