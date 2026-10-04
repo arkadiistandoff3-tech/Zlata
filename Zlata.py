@@ -793,7 +793,12 @@ def chat_post(user, msg_text):
 # -------------------------
 # Theme helpers
 # -------------------------
-def get_theme_colors(theme_name):
+def get_theme_colors(theme_name=None):
+    if not theme_name:
+        try:
+            theme_name = session.get("theme", DEFAULT_THEME)
+        except RuntimeError:
+            theme_name = DEFAULT_THEME
     theme = THEMES.get(theme_name, THEMES.get(DEFAULT_THEME))
     return theme["neon"], theme["muted"]
 
