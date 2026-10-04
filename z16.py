@@ -22,7 +22,7 @@ Install on Windows:
 Environment:
   SERVER_URL           e.g. https://your-server.example.com
   REMOTE_CLIENT_TOKEN  must match Zlata.py
-  REMOTE_FILES_ROOT    folder exposed to the file manager
+  REMOTE_FS_ROOTS      semicolon list: name=absolute_path;name=absolute_path
   ALLOW_REMOTE_CAMERA  1/0 (default 1)
   ALLOW_REMOTE_INPUT   1/0 (default 1)
   ALLOW_REMOTE_CMD     1/0 (default 0)
@@ -48,17 +48,56 @@ from PIL import ImageGrab
 SERVER_URL = os.environ.get("SERVER_URL", "https://zlata.onrender.com").rstrip("/")
 CLIENT_TOKEN = os.environ.get("REMOTE_CLIENT_TOKEN", "change-me-client-token")
 CLIENT_ID = os.environ.get("REMOTE_CLIENT_ID") or (str(uuid.getnode()) + "-" + socket.gethostname())
-PC_NAME = socket.gethostname()
+PC_NAME = os.environ.get("REMOTE_CLIENT_NAME", socket.gethostname())
 
 ALLOW_REMOTE_CAMERA = os.environ.get("ALLOW_REMOTE_CAMERA", "1") == "1"
 ALLOW_REMOTE_INPUT = os.environ.get("ALLOW_REMOTE_INPUT", "1") == "1"
 ALLOW_REMOTE_CMD = os.environ.get("ALLOW_REMOTE_CMD", "0") == "1"
 
-# Only this directory is exposed to the server file manager.
-REMOTE_FILES_ROOT = Path(
-    os.environ.get("REMOTE_FILES_ROOT", str(Path.home() / "RemoteNeonShare"))
-).expanduser().resolve()
-REMOTE_FILES_ROOT.mkdir(parents=True, exist_ok=True)
+# Explicitly configured roots.  The client never accepts a path outside these roots.
+def _default_fs_roots() -> dict[str, Path]:
+    home = Path.home().resolve()
+    roots = {"home": home}
+    candidates = {
+        "desktop": home / "Desktop",
+        "documents": home / "Documents",
+        "downloads": home / "Downloads",
+        "shared": home / "RemoteNeonShare",
+    }
+    for name, path in candidates.items():
+        if path.exists():
+            roots[name] = path.resolve()
+    return roots
+
+
+def _parse_fs_roots() -> dict[str, Path]:
+    raw = os.environ.get("REMOTE_FS_ROOTS", "").strip()
+    if not raw:
+        roots = _default_fs_roots()
+    else:
+        roots = {}
+        for item in raw.split(";"):
+            item = item.strip()
+            if not item or "=" not in item:
+                continue
+            name, value = item.split("=", 1)
+            name = name.strip().lower().replace(" ", "_")
+            value = value.strip()
+            if not name or not value:
+                continue
+            path = Path(value).expanduser().resolve()
+            if path.exists() and path.is_dir():
+                roots[name] = path
+    if not roots:
+        fallback = (home / "RemoteNeonShare").resolve() if 'home' in locals() else Path.home().resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        roots = {"shared": fallback}
+    for path in roots.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return roots
+
+
+REMOTE_FS_ROOTS = _parse_fs_roots()
 
 FRAME_INTERVAL = float(os.environ.get("FRAME_INTERVAL", "0.07"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "1.0"))
@@ -84,6 +123,13 @@ try:
 except Exception:
     CV2_AVAILABLE = False
 
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except Exception:
+    psutil = None
+    PSUTIL_AVAILABLE = False
+
 
 def headers() -> dict[str, str]:
     return {"X-Client-Token": CLIENT_TOKEN}
@@ -100,21 +146,48 @@ def post_json(path: str, payload: dict[str, Any], timeout: float = HTTP_TIMEOUT)
     return r.json()
 
 
-def safe_rel(rel: str) -> Path:
-    rel = (rel or "").replace("\\", "/").lstrip("/")
-    target = (REMOTE_FILES_ROOT / rel).resolve()
+def _split_remote_path(rel: str) -> tuple[str, Path, str]:
+    rel = (rel or "").replace("\\", "/").strip("/")
+    if not rel:
+        raise ValueError("root list")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    root_name = parts[0].lower()
+    if root_name not in REMOTE_FS_ROOTS:
+        raise ValueError("unknown filesystem root")
+    root = REMOTE_FS_ROOTS[root_name].resolve()
+    sub = Path(*parts[1:]) if len(parts) > 1 else Path()
+    target = (root / sub).resolve()
     try:
-        target.relative_to(REMOTE_FILES_ROOT)
+        target.relative_to(root)
     except ValueError:
         raise ValueError("Path traversal blocked")
-    return target
+    return root_name, target, "/".join(parts)
+
+
+def safe_rel(rel: str) -> Path:
+    return _split_remote_path(rel)[1]
 
 
 def rel_for(path: Path) -> str:
-    return path.resolve().relative_to(REMOTE_FILES_ROOT).as_posix()
+    resolved = path.resolve()
+    for name, root in REMOTE_FS_ROOTS.items():
+        try:
+            return f"{name}/{resolved.relative_to(root).as_posix()}".rstrip("/")
+        except ValueError:
+            continue
+    raise ValueError("path is outside configured roots")
 
 
 def file_list(rel: str) -> dict[str, Any]:
+    if not (rel or "").strip("/\\"):
+        items = []
+        for name, root in sorted(REMOTE_FS_ROOTS.items()):
+            try:
+                st = root.stat()
+                items.append({"name": name, "is_dir": True, "size": None, "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)), "rel": name})
+            except (OSError, PermissionError):
+                continue
+        return {"ok": True, "path": "", "items": items, "roots": {k: str(v) for k, v in REMOTE_FS_ROOTS.items()}}
     base = safe_rel(rel)
     if not base.exists():
         return {"ok": False, "error": "path not found"}
@@ -134,7 +207,7 @@ def file_list(rel: str) -> dict[str, Any]:
             })
         except (OSError, PermissionError):
             continue
-    return {"ok": True, "path": rel_for(base), "items": items}
+    return {"ok": True, "path": rel_for(base), "items": items, "roots": {k: str(v) for k, v in REMOTE_FS_ROOTS.items()}}
 
 
 def file_view(rel: str) -> dict[str, Any]:
@@ -165,8 +238,12 @@ def file_download(rel: str) -> dict[str, Any]:
 
 def file_delete(rel: str) -> dict[str, Any]:
     path = safe_rel(rel)
-    if path == REMOTE_FILES_ROOT:
-        return {"ok": False, "error": "cannot delete shared root"}
+    try:
+        _, target, rel_path = _split_remote_path(rel)
+        if rel_path.count("/") == 0:
+            return {"ok": False, "error": "cannot delete filesystem root"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     if not path.exists():
         return {"ok": False, "error": "not found"}
     try:
@@ -188,7 +265,8 @@ def file_upload(rel: str, name: str, data_b64: str) -> dict[str, Any]:
     parent.mkdir(parents=True, exist_ok=True)
     dest = (parent / Path(name).name).resolve()
     try:
-        dest.relative_to(REMOTE_FILES_ROOT)
+        root_name, _, _ = _split_remote_path(rel)
+        dest.relative_to(REMOTE_FS_ROOTS[root_name])
     except ValueError:
         return {"ok": False, "error": "path traversal blocked"}
     try:
@@ -333,6 +411,55 @@ def do_type(text: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+KEY_ALIASES = {
+    "return": "enter", "esc": "esc", "escape": "esc", "spacebar": "space",
+    "left": "left", "right": "right", "up": "up", "down": "down",
+    "pageup": "pageup", "pagedown": "pagedown", "home": "home", "end": "end",
+    "backspace": "backspace", "delete": "delete", "tab": "tab",
+    "insert": "insert", "printscreen": "printscreen",
+}
+KEY_MODIFIERS = {"ctrl", "alt", "shift", "win", "command", "cmd"}
+
+
+def do_key(key: str, modifiers: list[str] | None = None) -> dict[str, Any]:
+    if not ALLOW_REMOTE_INPUT:
+        return {"ok": False, "error": "remote input disabled on client"}
+    if not PYAUTOGUI_AVAILABLE:
+        return {"ok": False, "error": "pyautogui not installed"}
+    raw_key = str(key or "").strip().lower()
+    mapped = KEY_ALIASES.get(raw_key, raw_key)
+    if not mapped or len(mapped) > 32:
+        return {"ok": False, "error": "invalid key"}
+    mods = [str(m).strip().lower() for m in (modifiers or [])]
+    mods = [KEY_ALIASES.get(m, m) for m in mods]
+    if any(m not in KEY_MODIFIERS for m in mods):
+        return {"ok": False, "error": "invalid modifier"}
+    try:
+        if mods:
+            pyautogui.hotkey(*mods, mapped)
+        else:
+            pyautogui.press(mapped)
+        return {"ok": True, "key": mapped, "modifiers": mods}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def demo_prank(action: str) -> dict[str, Any]:
+    # Deliberately limited to harmless, opt-in local effects. No input locking,
+    # mouse swapping, arbitrary window movement, or hidden persistence.
+    if not ALLOW_REMOTE_INPUT:
+        return {"ok": False, "error": "remote effects disabled on client"}
+    action = str(action or "").lower()
+    try:
+        if action == "beep":
+            import winsound
+            winsound.MessageBeep()
+            return {"ok": True, "action": action}
+        return {"ok": False, "error": "unsupported safe demo effect"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def run_command(command: str) -> dict[str, Any]:
     if not ALLOW_REMOTE_CMD:
         return {"ok": False, "error": "remote command execution disabled on client"}
@@ -364,6 +491,12 @@ def handle_job(job: dict[str, Any]) -> dict[str, Any]:
     if action == "input_type":
         return do_type(payload.get("text", ""))
 
+    if action == "input_key":
+        return do_key(payload.get("key", ""), payload.get("modifiers") or [])
+
+    if action == "demo_prank":
+        return demo_prank(payload.get("effect", ""))
+
     if action == "camera_photo":
         return camera_photo()
 
@@ -392,6 +525,15 @@ def handle_job(job: dict[str, Any]) -> dict[str, Any]:
     return {"ok": False, "error": f"unknown action: {action}"}
 
 
+def telemetry() -> tuple[float | None, float | None]:
+    if not PSUTIL_AVAILABLE:
+        return None, None
+    try:
+        return float(psutil.cpu_percent(interval=None)), float(psutil.virtual_memory().percent)
+    except Exception:
+        return None, None
+
+
 def client_loop():
     global STREAMING_SCREEN, STREAMING_CAMERA, STOP
 
@@ -402,15 +544,20 @@ def client_loop():
                 caps.append("camera")
             if ALLOW_REMOTE_INPUT and PYAUTOGUI_AVAILABLE:
                 caps.append("input")
+                caps.append("keyboard_events")
+                caps.append("safe_demo_effects")
             if ALLOW_REMOTE_CMD:
                 caps.append("commands")
 
+            cpu, ram = telemetry()
             res = post_json(
                 "/api/heartbeat",
                 {
                     "client_id": CLIENT_ID,
                     "name": PC_NAME,
                     "caps": caps,
+                    "cpu": cpu,
+                    "ram": ram,
                 },
                 timeout=4,
             )
@@ -447,7 +594,9 @@ def main():
     print("Client ID:", CLIENT_ID)
     print("PC:", PC_NAME)
     print("Server:", SERVER_URL)
-    print("Shared files root:", REMOTE_FILES_ROOT)
+    print("Configured filesystem roots:")
+    for name, path in sorted(REMOTE_FS_ROOTS.items()):
+        print(f"  {name}: {path}")
     print("Camera enabled:", ALLOW_REMOTE_CAMERA and CV2_AVAILABLE)
     print("Input enabled:", ALLOW_REMOTE_INPUT and PYAUTOGUI_AVAILABLE)
     print("Remote CMD enabled:", ALLOW_REMOTE_CMD)
