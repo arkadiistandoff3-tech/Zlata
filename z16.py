@@ -27,7 +27,7 @@ Environment:
   REMOTE_FS_ROOTS      semicolon list: name=absolute_path;name=absolute_path
   ALLOW_REMOTE_CAMERA  1/0 (default 1)
   ALLOW_REMOTE_INPUT   1/0 (default 1)
-  ALLOW_REMOTE_CMD     1/0 (default 0)
+  ALLOW_REMOTE_CMD     1/0 (default 1; read-only diagnostics only)
 """
 from __future__ import annotations
 
@@ -59,6 +59,12 @@ try:
     import mss
 except Exception:
     mss = None
+try:
+    import websocket  # websocket-client
+    WEBSOCKET_AVAILABLE = True
+except Exception:
+    websocket = None
+    WEBSOCKET_AVAILABLE = False
 
 SERVER_URL = os.environ.get("SERVER_URL", "https://zlata.onrender.com").rstrip("/")
 CLIENT_TOKEN = os.environ.get("REMOTE_CLIENT_TOKEN", "change-me-client-token")
@@ -114,12 +120,12 @@ def _parse_fs_roots() -> dict[str, Path]:
 
 REMOTE_FS_ROOTS = _parse_fs_roots()
 
-FRAME_INTERVAL = max(0.05, float(os.environ.get("FRAME_INTERVAL", "0.08")))
+FRAME_INTERVAL = max(0.04, float(os.environ.get("FRAME_INTERVAL", "0.06")))
 HEARTBEAT_INTERVAL = max(0.5, float(os.environ.get("HEARTBEAT_INTERVAL", "1.0")))
 HTTP_TIMEOUT = max(2.0, float(os.environ.get("HTTP_TIMEOUT", "8")))
 SCREEN_JPEG_QUALITY = max(35, min(90, int(os.environ.get("SCREEN_JPEG_QUALITY", "65"))))
 SCREEN_MAX_WIDTH = max(640, int(os.environ.get("SCREEN_MAX_WIDTH", "2560")))
-SCREEN_MONITOR = max(0, int(os.environ.get("SCREEN_MONITOR", "1")))
+SCREEN_MONITOR = max(0, int(os.environ.get("SCREEN_MONITOR", "0")))
 
 STREAMING_SCREEN = False
 STREAMING_CAMERA = False
@@ -336,6 +342,31 @@ def file_upload(rel: str, name: str, data_b64: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+
+def _ws_server_url(path: str) -> str:
+    if SERVER_URL.startswith("https://"):
+        return "wss://" + SERVER_URL[len("https://"):].rstrip("/") + path
+    if SERVER_URL.startswith("http://"):
+        return "ws://" + SERVER_URL[len("http://"):].rstrip("/") + path
+    return SERVER_URL.rstrip("/") + path
+
+
+def _open_screen_socket():
+    if not WEBSOCKET_AVAILABLE:
+        return None
+    url = _ws_server_url(f"/ws/client/screen/{CLIENT_ID}")
+    try:
+        return websocket.create_connection(
+            url,
+            timeout=6,
+            header=[f"X-Client-Token: {CLIENT_TOKEN}"],
+            enable_multithread=True,
+            http_proxy_host=None,
+            http_proxy_port=None,
+        )
+    except Exception:
+        return None
+
 def capture_screen_jpeg(quality: int = SCREEN_JPEG_QUALITY) -> bytes:
     """Capture the selected physical display on Windows/macOS/Linux.
 
@@ -350,7 +381,10 @@ def capture_screen_jpeg(quality: int = SCREEN_JPEG_QUALITY) -> bytes:
             shot = sct.grab(monitors[idx])
             img = Image.frombytes("RGB", shot.size, shot.rgb)
     elif ImageGrab is not None:
-        img = ImageGrab.grab()
+        try:
+            img = ImageGrab.grab(all_screens=True)
+        except TypeError:
+            img = ImageGrab.grab()
         img = img.convert("RGB")
     else:
         raise RuntimeError("No screen capture backend installed")
@@ -366,21 +400,50 @@ def capture_screen_jpeg(quality: int = SCREEN_JPEG_QUALITY) -> bytes:
 
 def stream_screen_loop():
     global STREAMING_SCREEN
+    ws = None
     consecutive_errors = 0
     while not STOP:
         if not STREAMING_SCREEN:
-            time.sleep(0.25)
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                ws = None
+            time.sleep(0.20)
             continue
+
         try:
+            if ws is None and WEBSOCKET_AVAILABLE:
+                ws = _open_screen_socket()
+
             frame = capture_screen_jpeg()
-            _http_post(
-                f"/api/upload_frame/{CLIENT_ID}",
-                data=frame,
-                timeout=3,
-            )
+            if not frame:
+                time.sleep(FRAME_INTERVAL)
+                continue
+
+            if ws is not None:
+                try:
+                    ws.send_binary(frame)
+                except Exception:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    ws = None
+                    # One HTTP fallback frame keeps the demo alive while WS reconnects.
+                    _http_post(f"/api/upload_frame/{CLIENT_ID}", data=frame, timeout=3)
+            else:
+                _http_post(f"/api/upload_frame/{CLIENT_ID}", data=frame, timeout=3)
             consecutive_errors = 0
         except Exception:
             consecutive_errors += 1
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                ws = None
             if consecutive_errors >= 5:
                 time.sleep(1.0)
         time.sleep(FRAME_INTERVAL)
@@ -583,7 +646,8 @@ def _system_beep() -> None:
 def _desktop_notify(title: str, message: str) -> bool:
     try:
         if IS_MACOS:
-            script = f'display notification {message!r} with title {title!r}'
+            import json
+            script = f"display notification {json.dumps(message, ensure_ascii=False)} with title {json.dumps(title, ensure_ascii=False)}"
             subprocess.run(["osascript", "-e", script], timeout=4, check=False, capture_output=True)
             return True
         if IS_WINDOWS:
@@ -648,20 +712,88 @@ def demo_prank(action: str, seconds: int = 3) -> dict[str, Any]:
 
 
 def run_command(command: str) -> dict[str, Any]:
+    """Run a small allowlist of read-only diagnostics on the local client."""
     if not ALLOW_REMOTE_CMD:
         return {"ok": False, "error": "remote command execution disabled on client"}
+    raw = str(command or "").strip()
+    if not raw:
+        return {"ok": False, "error": "empty command"}
     try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        import shlex
+        parts = shlex.split(raw, posix=not IS_WINDOWS)
+    except Exception as exc:
+        return {"ok": False, "error": f"invalid command: {exc}"}
+    if not parts:
+        return {"ok": False, "error": "empty command"}
+
+    name = parts[0].lower()
+    allowed = {
+        "hostname", "whoami", "uname", "sw_vers", "ver", "ipconfig", "ifconfig",
+        "netstat", "systeminfo", "tasklist", "df", "free", "ps", "ip", "echo"
+    }
+    if name not in allowed:
+        return {"ok": False, "error": "command not allowed; use a read-only diagnostic command"}
+
+    # Restrict arguments to simple flags / words for the diagnostic set.
+    if any(";" in p or "&&" in p or "||" in p or "|" in p or "`" in p for p in parts):
+        return {"ok": False, "error": "shell operators are not allowed"}
+    if len(parts) > 8:
+        return {"ok": False, "error": "too many arguments"}
+
+    # Only read-only forms are accepted for potentially privileged diagnostic tools.
+    if name == "ip" and parts[1:] and parts[1].lower() not in {"addr", "a", "link", "route"}:
+        return {"ok": False, "error": "only read-only 'ip addr/link/route' diagnostics are allowed"}
+    if name == "ifconfig" and len(parts) > 1:
+        return {"ok": False, "error": "use ifconfig without modifying arguments"}
+
+    if name == "echo":
+        return {"ok": True, "output": " ".join(parts[1:])[:10000], "returncode": 0}
+
+    if IS_WINDOWS:
+        commands = {
+            "hostname": ["hostname"],
+            "whoami": ["whoami"],
+            "ver": ["cmd.exe", "/c", "ver"],
+            "ipconfig": ["ipconfig"],
+            "systeminfo": ["systeminfo"],
+            "tasklist": ["tasklist"],
+            "netstat": ["netstat", *parts[1:]],
+        }
+    elif IS_MACOS:
+        commands = {
+            "hostname": ["hostname"],
+            "whoami": ["whoami"],
+            "uname": ["uname", *parts[1:]],
+            "sw_vers": ["sw_vers"],
+            "ifconfig": ["ifconfig"],
+            "netstat": ["netstat", *parts[1:]],
+            "df": ["df", *parts[1:]],
+            "ps": ["ps", *parts[1:]],
+        }
+    else:
+        commands = {
+            "hostname": ["hostname"],
+            "whoami": ["whoami"],
+            "uname": ["uname", *parts[1:]],
+            "ifconfig": ["ifconfig", *parts[1:]],
+            "ip": ["ip", *parts[1:]],
+            "netstat": ["netstat", *parts[1:]],
+            "df": ["df", *parts[1:]],
+            "free": ["free", *parts[1:]],
+            "ps": ["ps", *parts[1:]],
+        }
+    argv = commands.get(name)
+    if argv is None:
+        return {"ok": False, "error": f"command '{name}' is not available on this OS"}
+
+    try:
+        proc = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=20)
         output = (proc.stdout or "") + (proc.stderr or "")
         if not output.strip():
             output = "[command completed]"
-        return {"ok": True, "output": output[-100_000:], "returncode": proc.returncode}
+        return {"ok": proc.returncode == 0, "output": output[-100_000:], "returncode": proc.returncode}
+    except FileNotFoundError:
+        return {"ok": False, "error": f"command '{name}' is not installed on this client"}
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "command timeout"}
     except Exception as exc:
@@ -819,6 +951,7 @@ def client_loop():
                 caps.append("safe_demo_effects")
             if ALLOW_REMOTE_CMD:
                 caps.append("commands")
+                caps.append("diagnostics")
 
             cpu, ram = telemetry()
             res = post_json(
