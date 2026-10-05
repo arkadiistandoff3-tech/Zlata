@@ -188,26 +188,11 @@ DEFAULT_THEME = "green"
 # Preserve the exact z15 prank list/UI. Actual Windows effects cannot execute on
 # Render; the adapter below exposes only safe/remote-compatible behaviour.
 TROLLS = {
-    "block": {"short": "Блок вводу", "long": "Повністю блокує мишку та клавіатуру на заданий час"},
-    "mouse": {"short": "Миша хаос", "long": "Міняє місцями кнопки миші, ускладнюючи керування"},
-    "disco": {"short": "Диско вікон", "long": "Вікна хаотично відкриваються, закриваються та рухаються"},
-    "beep": {"short": "Системні біпи", "long": "Програє випадкові системні звукові сигнали"},
-    "shake": {"short": "Тряска вікна", "long": "Активне вікно починає різко трястися"},
-    "invert": {"short": "Інверсія", "long": "Інвертує кольори екрана, створюючи ефект зламаного дисплея"},
-    "drift": {"short": "Знос миші", "long": "Курсор повільно самовільно відхиляється в різні сторони"},
-    "minall": {"short": "Згорнути все", "long": "Миттєво згортає всі відкриті вікна"},
-    "altab": {"short": "Alt+Tab", "long": "Хаотично перемикає активні вікна між програмами"},
-    "notify": {"short": "Фейк повідомлення", "long": "Показує фальшиве системне повідомлення"},
-    "scroll": {"short": "Реверс скролу", "long": "Інвертує напрямок прокрутки коліщатка миші"},
-    "type": {"short": "Фейк друк", "long": "Система сама вводить випадковий текст"},
-    "freeze": {"short": "Фріз", "long": "Імітує зависання вікон без реального краху"},
-    "blink": {"short": "Блимання", "long": "Екран коротко блимає чорним кольором"},
-    "volume": {"short": "Гучність хаос", "long": "Різко змінює рівень системної гучності"},
-    "usb": {"short": "USB звук", "long": "Відтворює звук підключення та відключення USB"},
-    "focus": {"short": "Крадіжка фокусу", "long": "Постійно перехоплює фокус активного вікна"},
-    "task": {"short": "Панель задач", "long": "Ховає та показує панель задач Windows"},
-    "cursor": {"short": "Курсор хаос", "long": "Різко змінює позицію курсора"},
-    "almost": {"short": "Майже нічого", "long": "Створює відчуття, що щось зламалось… але ні 😈"},
+    "beep": {"short": "🔊 Біп", "long": "Один системний звуковий сигнал"},
+    "double_beep": {"short": "🔊 Подвійний біп", "long": "Два короткі системні сигнали"},
+    "random_beeps": {"short": "🎵 Біп-хаос", "long": "Кілька коротких системних сигналів протягом заданого часу"},
+    "notify": {"short": "🔔 Повідомлення", "long": "Показує звичайне тестове desktop-повідомлення"},
+    "combo": {"short": "😈 Комбо", "long": "Короткий звук + тестове повідомлення + ще один звук"},
 }
 TROLL_STATE = {k: False for k in TROLLS}
 TROLL_EVENTS = {k: threading.Event() for k in TROLLS}
@@ -3017,6 +3002,12 @@ function runTroll(action, btn) {
   })
   .then(r=>r.json())
   .then(d=>{
+    if (d.done) {
+      btn.classList.remove("active");
+      btn.textContent = d.ok ? `✓ ${btn.dataset.label}` : `✕ ${btn.dataset.label}`;
+      setTimeout(()=>{ btn.textContent = btn.dataset.label; }, 1300);
+      return;
+    }
     if (!d.active) return;
 
     btn.classList.add("active");
@@ -4303,11 +4294,18 @@ def _adapt_troll_toggle():
     if not has_remote_permission():
         return jsonify(ok=False, error="no access"), 403
     data = _json_body()
-    action = str(data.get("action", ""))
-    if action == "beep":
-        result = _job_sync("demo_prank", timeout=10, effect="beep")
-        return jsonify(result)
-    return jsonify(ok=False, active=False, error="this Render server only exposes the harmless z16 demo prank")
+    action = str(data.get("action", "")).strip().lower()
+    allowed = {"beep", "double_beep", "random_beeps", "notify", "combo"}
+    if action not in allowed:
+        return jsonify(ok=False, active=False, error="unsupported safe demo effect"), 400
+    try:
+        seconds = max(1, min(int(data.get("seconds", 3)), 15))
+    except Exception:
+        seconds = 3
+    result = _job_sync("demo_prank", timeout=max(10, seconds + 5), effect=action, seconds=seconds)
+    result.setdefault("active", False)
+    result["done"] = True
+    return jsonify(result)
 
 def _adapt_prank_disco():
     return jsonify(ok=False, disabled=True, error="window prank is not executed by Render; use the Windows z16 client")
