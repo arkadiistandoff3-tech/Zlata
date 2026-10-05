@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: zlata-remote
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --config gunicorn.conf.py Zlata_modified:app
+    healthCheckPath: /healthz
