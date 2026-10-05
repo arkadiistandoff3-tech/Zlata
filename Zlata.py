@@ -2320,8 +2320,8 @@ textarea{width:100%;background:#000;color:var(--neon);border:1px solid var(--bor
 /* ===== LAYOUT ===== */
 .layout{
   display:grid;
-  grid-template-columns:1fr;
-  height:100vh;
+  grid-template-columns:minmax(0,1fr) 340px;
+  min-height:100vh;
 }
 
 .card{
@@ -2503,10 +2503,129 @@ input[type=range]::-webkit-slider-thumb {
   box-shadow: 0 0 10px var(--neon);
 }
 
+.pc-menu{
+  min-height:100vh;
+  padding:20px;
+}
+.pc-menu-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+  margin-bottom:16px;
+}
+.pc-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
+  gap:14px;
+}
+.pc-tile{
+  display:flex;
+  flex-direction:column;
+  min-height:150px;
+  padding:15px;
+  background:linear-gradient(145deg,rgba(255,255,255,.045),rgba(0,0,0,.32));
+  border:1px solid var(--border);
+  border-radius:14px;
+  transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease;
+}
+.pc-tile:hover{
+  transform:translateY(-2px);
+  border-color:var(--neon);
+  box-shadow:0 8px 28px rgba(0,0,0,.22);
+}
+.pc-tile.selected{
+  border-color:var(--neon);
+}
+.pc-tile-top{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-start;
+  gap:8px;
+  margin-bottom:12px;
+}
+.pc-name{
+  font-size:16px;
+  font-weight:700;
+  color:#fff;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.pc-meta{
+  font-size:12px;
+  color:var(--muted);
+  line-height:1.5;
+}
+.pc-actions{
+  margin-top:auto;
+  padding-top:12px;
+}
+.pc-actions .btn{
+  width:100%;
+}
+.badge{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  padding:3px 7px;
+  border:1px solid var(--border);
+  border-radius:999px;
+  font-size:11px;
+  color:var(--muted);
+  white-space:nowrap;
+}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e}
+.dot.off{background:#64748b}
+.empty-pc{
+  padding:40px 20px;
+  text-align:center;
+  border:1px dashed var(--border);
+  border-radius:14px;
+  color:var(--muted);
+}
+.mobile-menu-btn{
+  display:none;
+  position:fixed;
+  top:10px;
+  left:10px;
+  z-index:120;
+}
+
+@media (max-width: 900px){
+  .layout{grid-template-columns:1fr;}
+  .right{border-left:0;}
+  .pc-menu{padding:14px; padding-top:60px;}
+  .pc-grid{grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:10px;}
+  .right-panel{display:none;}
+}
+
+@media (max-width: 560px){
+  body{font-size:14px;}
+  .pc-menu{padding:12px;padding-top:58px;}
+  .pc-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;}
+  .pc-tile{min-height:135px;padding:12px;border-radius:12px;}
+  .pc-name{font-size:14px;}
+  .pc-meta{font-size:11px;}
+  .main,.right{padding:10px;}
+  .card{padding:10px;margin-bottom:10px;}
+  img.screen{min-height:180px;object-fit:contain;background:#000;}
+  .top-panel{height:auto;min-height:64px;padding:10px;flex-wrap:wrap;}
+  .top-panel form{display:flex;flex-wrap:wrap;justify-content:center;gap:7px;}
+  .top-panel .btn{padding:7px 10px;font-size:12px;}
+  .sidebar{width:min(86vw,300px);overflow:auto;}
+  textarea{min-height:110px;}
+  .device-table{font-size:12px;}
+  .device-table th,.device-table td{padding:6px 4px;}
+}
+
 </style>
 </head>
 
 <body>
+
+<button class="btn mobile-menu-btn" id="mobileMenuBtn" type="button" onclick="toggleMobileSidebar()">☰</button>
 
 <div class="overlay" id="overlay" onclick="closeAll()"></div>
 
@@ -2523,6 +2642,14 @@ input[type=range]::-webkit-slider-thumb {
 </div>
 
 <div class="sidebar" id="sidebar">
+  {% if selected_client_id %}
+  <div class="card" style="margin-bottom:12px">
+    <div class="small" style="margin-bottom:7px">Поточний ПК</div>
+    <b style="display:block;margin-bottom:10px">{{ active_title }}</b>
+    <a class="btn" href="{{ url_for('exit_pc') }}" style="display:block;text-align:center;text-decoration:none">↩ Вийти з ПК</a>
+  </div>
+  {% endif %}
+
   <div class="nav">
     <a href="{{ url_for('files_navigate', path='') }}">📁 File System</a>
     <a href="{{ url_for('camera_page') }}">📷 Camera</a>
@@ -2550,31 +2677,47 @@ input[type=range]::-webkit-slider-thumb {
   {% endif %}
 </div>
 
-<div class="layout">
-  <div class="main">
-    <div class="card" id="devices-card">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-        <b>💻 Всі ПК</b>
-        <span class="badge">{{ clients|selectattr("online")|list|length }} online / {{ clients|length }} total</span>
+{% if not selected_client_id %}
+<div class="pc-menu">
+  <div class="pc-menu-header">
+    <div>
+      <div style="font-size:24px;font-weight:800;color:#fff">💻 Ваші ПК</div>
+      <div class="small" style="margin-top:5px">Оберіть комп'ютер, щоб відкрити панель керування</div>
+    </div>
+    <span class="badge">{{ clients|selectattr("online")|list|length }} online / {{ clients|length }} total</span>
+  </div>
+
+  {% if clients %}
+  <div class="pc-grid">
+    {% for pc in clients %}
+    <div class="pc-tile {% if pc.id == selected_client_id %}selected{% endif %}">
+      <div class="pc-tile-top">
+        <div class="pc-name" title="{{ pc.name }}">{{ pc.name }}</div>
+        <span class="badge"><span class="dot {{ '' if pc.online else 'off' }}"></span>{{ 'Online' if pc.online else 'Offline' }}</span>
       </div>
-      <div style="margin-top:10px" class="collapsible-body">
-        <table class="device-table">
-          <thead><tr><th>Назва</th><th>IP</th><th>Статус</th><th>Last seen</th><th></th></tr></thead>
-          <tbody>
-          {% for pc in clients %}
-            <tr>
-              <td>{{ pc.name }}</td>
-              <td>{{ pc.ip }}</td>
-              <td><span class="status-dot {{ 'off' if not pc.online else '' }}"></span>{{ 'Online' if pc.online else 'Offline' }}</td>
-              <td>{{ pc.last_seen_text }}</td>
-              <td>{% if pc.online %}<form method="POST" action="{{ url_for('_select_client') }}"><input type="hidden" name="cid" value="{{ pc.id }}"><input type="hidden" name="next" value="{{ url_for('index') }}"><button class="collapse-btn" type="submit">{{ 'Обрано' if pc.id == selected_client_id else 'Вибрати' }}</button></form>{% endif %}</td>
-            </tr>
-          {% else %}<tr><td colspan="5">Немає зареєстрованих ПК.</td></tr>{% endfor %}
-          </tbody>
-        </table>
+      <div class="pc-meta">IP: {{ pc.ip }}</div>
+      <div class="pc-meta">Last seen: {{ pc.last_seen_text }}</div>
+      <div class="pc-actions">
+        {% if pc.online %}
+        <form method="POST" action="{{ url_for('_select_client') }}">
+          <input type="hidden" name="cid" value="{{ pc.id }}">
+          <input type="hidden" name="next" value="{{ url_for('index') }}">
+          <button class="btn" type="submit">Відкрити ПК</button>
+        </form>
+        {% else %}
+        <button class="btn" type="button" disabled style="opacity:.45;cursor:not-allowed">Недоступний</button>
+        {% endif %}
       </div>
     </div>
-
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-pc">Поки що немає зареєстрованих ПК.</div>
+  {% endif %}
+</div>
+{% else %}
+<div class="layout">
+  <div class="main">
     <div class="card collapsible">
       <div class="stat-header"><b>🖥 Демонстрація</b><button class="collapse-btn" type="button" onclick="toggleBlock('screenBlock',this)">Сховати</button></div>
       <div id="screenBlock" class="collapsible-body"><img src="{{ url_for('screen_feed', cid=selected_client_id) }}" class="screen"></div>
@@ -2586,77 +2729,73 @@ input[type=range]::-webkit-slider-thumb {
       <form method="POST" action="{{ url_for('run_cmd_route') }}">
         <textarea name="cmd"></textarea>
         <input type="hidden" name="shell" id="shellInput" value="cmd">
-
         <div class="shell-switch">
           <button type="button" onclick="setShell('cmd',this)" class="active">CMD</button>
           <button type="button" onclick="setShell('powershell',this)">PowerShell</button>
         </div>
-
         <button class="btn" style="margin-top:8px">Run</button>
       </form>
       <pre>{{ cmd_output or "—" }}</pre>
       </div>
     </div>
+
     <div class="card">
-  <b>🔊 Гучність</b>
-
-  <div style="display:flex; align-items:center; gap:12px; margin-top:10px;">
-    <input
-      type="range"
-      min="0"
-      max="100"
-      value="50"
-      id="volumeSlider"
-      style="flex:1;"
-    >
-    <span id="volumeVal">50%</span>
-  </div>
-</div>
-
+      <b>🔊 Гучність</b>
+      <div style="display:flex;align-items:center;gap:12px;margin-top:10px;">
+        <input type="range" min="0" max="100" value="50" id="volumeSlider" style="flex:1;">
+        <span id="volumeVal">50%</span>
+      </div>
+    </div>
   </div>
 
   <div class="right">
     <div class="card collapsible">
-      <div class="stat-header">
-        <span>CPU <span id="cpuVal">{{ cpu }}%</span></span>
-        <button class="collapse-btn" type="button" onclick="toggleBlock('cpuBlock',this)">Сховати</button>
-      </div>
-      <div id="cpuBlock" class="collapsible-body">
-        <div class="bar"><div id="cpuBar"></div></div>
-        <canvas id="cpuChart" width="320" height="60"></canvas>
+      <div class="stat-header"><b>💻 ПК</b><a class="collapse-btn" href="{{ url_for('exit_pc') }}" style="text-decoration:none">Вийти з ПК</a></div>
+      <div class="small" style="margin-top:-2px;margin-bottom:10px;color:var(--muted)">{{ active_title }} · {{ selected_client.ip if selected_client else '?' }}</div>
+      <div style="max-height:260px;overflow:auto;">
+        {% for pc in clients %}
+        <div class="client-row {% if pc.id == selected_client_id %}selected{% endif %}" style="margin-bottom:8px;padding:9px;border:1px solid var(--border);border-radius:8px">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+            <b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ pc.name }}</b>
+            <span class="badge"><span class="dot {{ '' if pc.online else 'off' }}"></span>{{ 'Online' if pc.online else 'Offline' }}</span>
+          </div>
+          <div class="small" style="margin-top:4px">{{ pc.ip }}</div>
+          {% if pc.online and pc.id != selected_client_id %}
+          <form method="POST" action="{{ url_for('_select_client') }}" style="margin-top:7px">
+            <input type="hidden" name="cid" value="{{ pc.id }}">
+            <input type="hidden" name="next" value="{{ url_for('index') }}">
+            <button class="btn" type="submit" style="width:100%">Відкрити</button>
+          </form>
+          {% endif %}
+        </div>
+        {% endfor %}
       </div>
     </div>
 
     <div class="card collapsible">
-      <div class="stat-header">
-        <span>RAM <span id="ramVal">{{ ram }}%</span></span>
-        <button class="collapse-btn" type="button" onclick="toggleBlock('ramBlock',this)">Сховати</button>
-      </div>
-      <div id="ramBlock" class="collapsible-body">
-        <div class="bar"><div id="ramBar"></div></div>
-        <canvas id="ramChart" width="320" height="60"></canvas>
-      </div>
+      <div class="stat-header"><span>CPU <span id="cpuVal">{{ cpu }}%</span></span><button class="collapse-btn" type="button" onclick="toggleBlock('cpuBlock',this)">Сховати</button></div>
+      <div id="cpuBlock" class="collapsible-body"><div class="bar"><div id="cpuBar"></div></div><canvas id="cpuChart" width="320" height="60"></canvas></div>
     </div>
+
+    <div class="card collapsible">
+      <div class="stat-header"><span>RAM <span id="ramVal">{{ ram }}%</span></span><button class="collapse-btn" type="button" onclick="toggleBlock('ramBlock',this)">Сховати</button></div>
+      <div id="ramBlock" class="collapsible-body"><div class="bar"><div id="ramBar"></div></div><canvas id="ramChart" width="320" height="60"></canvas></div>
+    </div>
+  </div>
+
   <div class="right-panel">
-  <h3 style="color:#e5e7eb; margin-bottom:10px;">
-    🎭 Пранки
-  </h3>
-
-  <div class="right-panel-content">
-    {% for key, t in TROLLS.items() %}
-  <button class="troll-btn"
-          data-label="{{ t.short }}"
-          data-desc="{{ t.long }}"
-          onclick="runTroll('{{ key }}', this)">
-    {{ t.short }}
-    <div class="troll-desc"></div>
-  </button>
-{% endfor %}
-
+    <h3 style="color:#e5e7eb;margin-bottom:10px;">🎭 Пранки</h3>
+    <div class="right-panel-content">
+      {% for key, t in TROLLS.items() %}
+      <button class="troll-btn" data-label="{{ t.short }}" data-desc="{{ t.long }}" onclick="runTroll('{{ key }}', this)">
+        {{ t.short }}<div class="troll-desc"></div>
+      </button>
+      {% endfor %}
+    </div>
   </div>
 </div>
+{% endif %}
 
-</div>
 <script>
 document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll(".troll-btn").forEach(btn => {
@@ -2683,26 +2822,21 @@ document.addEventListener("DOMContentLoaded", () => {
 <script>
 const volSlider = document.getElementById("volumeSlider");
 const volVal = document.getElementById("volumeVal");
+if (volSlider && volVal) {
+  fetch("/api/volume", {cache:"no-store"})
+    .then(r => r.json())
+    .then(d => { volSlider.value = d.value; volVal.textContent = d.value + "%"; })
+    .catch(() => {});
 
-// завантажити поточну гучність
-fetch("/api/volume")
-  .then(r => r.json())
-  .then(d => {
-    volSlider.value = d.value;
-    volVal.textContent = d.value + "%";
+  volSlider.addEventListener("input", () => {
+    const v = volSlider.value;
+    volVal.textContent = v + "%";
+    fetch("/api/volume", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({value:v})
+    }).catch(() => {});
   });
-
-// міняти гучність при русі
-volSlider.addEventListener("input", () => {
-  const v = volSlider.value;
-  volVal.textContent = v + "%";
-
-  fetch("/api/volume", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({value: v})
-  });
-});
+}
 
 const overlay=document.getElementById('overlay');
 const sidebar=document.getElementById('sidebar');
@@ -2749,6 +2883,12 @@ function closeAll(){
   overlay.classList.remove('show');
 }
 
+function toggleMobileSidebar(){
+  sidebar.classList.toggle('open');
+  topPanel.classList.remove('open');
+  overlay.classList.toggle('show', sidebar.classList.contains('open'));
+}
+
 function applyTheme(t){
   fetch("{{ url_for('set_theme') }}",{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify({theme:t})});
   document.documentElement.style.setProperty('--neon',t);
@@ -2767,51 +2907,53 @@ function toggleBlock(id, btn){
   btn.textContent=hidden?'Показати':'Сховати';
 }
 
-const cpuCtx=document.getElementById("cpuChart").getContext("2d");
-const ramCtx=document.getElementById("ramChart").getContext("2d");
-const cpuBar=document.getElementById("cpuBar");
-const ramBar=document.getElementById("ramBar");
+const cpuCanvas=document.getElementById("cpuChart");
+const ramCanvas=document.getElementById("ramChart");
+if(cpuCanvas && ramCanvas){
+  const cpuCtx=cpuCanvas.getContext("2d");
+  const ramCtx=ramCanvas.getContext("2d");
+  const cpuBar=document.getElementById("cpuBar");
+  const ramBar=document.getElementById("ramBar");
+  const cpuVal=document.getElementById("cpuVal");
+  const ramVal=document.getElementById("ramVal");
 
-let cpuData=new Array(40).fill(0);
-let ramData=new Array(40).fill(0);
+  let cpuData=new Array(40).fill(0);
+  let ramData=new Array(40).fill(0);
 
-function draw(ctx,data){
-  ctx.clearRect(0,0,320,60);
-  ctx.beginPath();
-  ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--neon');
-  data.forEach((v,i)=>{
-    const x=i*8;
-    const y=60-(v*0.6);
-    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
-  });
-  ctx.stroke();
+  function draw(ctx,data){
+    ctx.clearRect(0,0,320,60);
+    ctx.beginPath();
+    ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--neon');
+    data.forEach((v,i)=>{
+      const x=i*8;
+      const y=60-(v*0.6);
+      i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+    });
+    ctx.stroke();
+  }
+
+  let updateBusy=false;
+  async function update(){
+    if(updateBusy)return;
+    updateBusy=true;
+    try {
+      const r=await fetch("/api/system",{cache:"no-store"});
+      if(!r.ok)return;
+      const d=await r.json();
+      cpuBar.style.width=d.cpu+"%";
+      ramBar.style.width=d.ram+"%";
+      cpuVal.innerText=d.cpu.toFixed(0)+"%";
+      ramVal.innerText=d.ram.toFixed(0)+"%";
+      cpuData.push(d.cpu);cpuData.shift();
+      ramData.push(d.ram);ramData.shift();
+      draw(cpuCtx,cpuData);
+      draw(ramCtx,ramData);
+    } catch(e) { /* server temporarily unavailable */ } finally { updateBusy=false; }
+  }
+
+  update();
+  setInterval(update,1500);
 }
-
-let updateBusy=false;
-async function update(){
-  if(updateBusy)return;
-  updateBusy=true;
-  try {
-  const r=await fetch("/api/system",{cache:"no-store"});
-  if(!r.ok)return;
-  const d=await r.json();
-
-  cpuBar.style.width=d.cpu+"%";
-  ramBar.style.width=d.ram+"%";
-
-  cpuVal.innerText=d.cpu.toFixed(0)+"%";
-  ramVal.innerText=d.ram.toFixed(0)+"%";
-
-  cpuData.push(d.cpu);cpuData.shift();
-  ramData.push(d.ram);ramData.shift();
-
-  draw(cpuCtx,cpuData);
-  draw(ramCtx,ramData);
-  } catch(e) { /* server temporarily unavailable */ } finally { updateBusy=false; }
-}
-
-update();
-setInterval(update,1500);
 function startDisco(){
   const sec = document.getElementById("discoSec").value;
   fetch("/prank/disco?sec=" + sec);
@@ -4001,6 +4143,12 @@ def _remote_heartbeat():
     _save_client_registry()
     return jsonify(stream_screen=bool(c.get("stream_screen")), stream_camera=bool(c.get("stream_camera")), commands=jobs, server_ts=current_ts())
 
+@app.get("/exit_pc")
+@login_required
+def exit_pc():
+    session.pop("selected_client", None)
+    return redirect(url_for("index"))
+
 @app.get("/api/clients")
 @login_required
 def _api_clients():
@@ -4360,11 +4508,9 @@ def _adapt_index():
 
     selected_cid = session.get("selected_client")
     selected = next((x for x in snapshot if x["id"] == selected_cid and x["online"]), None)
-    if not selected:
-        selected = next((x for x in snapshot if x["online"]), None)
-        selected_cid = selected["id"] if selected else None
-        if selected_cid:
-            session["selected_client"] = selected_cid
+    if selected_cid and selected is None:
+        session.pop("selected_client", None)
+        selected_cid = None
 
     if selected:
         cpu = float(selected.get("cpu") or 0.0)
