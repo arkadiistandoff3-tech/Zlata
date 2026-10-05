@@ -123,6 +123,8 @@ REMOTE_FS_ROOTS = _parse_fs_roots()
 FRAME_INTERVAL = max(0.04, float(os.environ.get("FRAME_INTERVAL", "0.06")))
 HEARTBEAT_INTERVAL = max(0.5, float(os.environ.get("HEARTBEAT_INTERVAL", "1.0")))
 HTTP_TIMEOUT = max(2.0, float(os.environ.get("HTTP_TIMEOUT", "8")))
+OFFLINE_BACKOFF_MIN = max(2.0, float(os.environ.get("OFFLINE_BACKOFF_MIN", "2")))
+OFFLINE_BACKOFF_MAX = max(10.0, float(os.environ.get("OFFLINE_BACKOFF_MAX", "60")))
 SCREEN_JPEG_QUALITY = max(35, min(90, int(os.environ.get("SCREEN_JPEG_QUALITY", "65"))))
 SCREEN_MAX_WIDTH = max(640, int(os.environ.get("SCREEN_MAX_WIDTH", "2560")))
 SCREEN_MONITOR = max(0, int(os.environ.get("SCREEN_MONITOR", "0")))
@@ -358,14 +360,36 @@ def _open_screen_socket():
     try:
         return websocket.create_connection(
             url,
-            timeout=6,
+            timeout=5,
             header=[f"X-Client-Token: {CLIENT_TOKEN}"],
             enable_multithread=True,
             http_proxy_host=None,
             http_proxy_port=None,
+            suppress_origin=True,
         )
     except Exception:
         return None
+
+def _server_host_port() -> tuple[str, int]:
+    from urllib.parse import urlparse
+    parsed = urlparse(SERVER_URL)
+    host = parsed.hostname or ""
+    if parsed.port:
+        port = parsed.port
+    else:
+        port = 443 if parsed.scheme == "https" else 80
+    return host, port
+
+def _network_available() -> bool:
+    """Cheap connectivity check without generating an HTTP request storm."""
+    try:
+        host, port = _server_host_port()
+        if not host:
+            return False
+        with socket.create_connection((host, port), timeout=2.5):
+            return True
+    except Exception:
+        return False
 
 def capture_screen_jpeg(quality: int = SCREEN_JPEG_QUALITY) -> bytes:
     """Capture the selected physical display on Windows/macOS/Linux.
@@ -402,6 +426,8 @@ def stream_screen_loop():
     global STREAMING_SCREEN
     ws = None
     consecutive_errors = 0
+    ws_retry_at = 0.0
+    ws_retry_delay = 1.0
     while not STOP:
         if not STREAMING_SCREEN:
             if ws is not None:
@@ -410,12 +436,19 @@ def stream_screen_loop():
                 except Exception:
                     pass
                 ws = None
+            ws_retry_delay = 1.0
             time.sleep(0.20)
             continue
 
         try:
-            if ws is None and WEBSOCKET_AVAILABLE:
+            now = time.time()
+            if ws is None and WEBSOCKET_AVAILABLE and now >= ws_retry_at:
                 ws = _open_screen_socket()
+                if ws is None:
+                    ws_retry_at = now + ws_retry_delay
+                    ws_retry_delay = min(ws_retry_delay * 2.0, 15.0)
+                else:
+                    ws_retry_delay = 1.0
 
             frame = capture_screen_jpeg()
             if not frame:
@@ -431,9 +464,15 @@ def stream_screen_loop():
                     except Exception:
                         pass
                     ws = None
-                    # One HTTP fallback frame keeps the demo alive while WS reconnects.
-                    _http_post(f"/api/upload_frame/{CLIENT_ID}", data=frame, timeout=3)
+                    ws_retry_at = time.time() + ws_retry_delay
+                    ws_retry_delay = min(ws_retry_delay * 2.0, 15.0)
+                    # Single HTTP fallback frame; do not spam the server.
+                    try:
+                        _http_post(f"/api/upload_frame/{CLIENT_ID}", data=frame, timeout=3)
+                    except Exception:
+                        pass
             else:
+                # WS temporarily unavailable; one low-rate HTTP fallback frame.
                 _http_post(f"/api/upload_frame/{CLIENT_ID}", data=frame, timeout=3)
             consecutive_errors = 0
         except Exception:
@@ -444,10 +483,9 @@ def stream_screen_loop():
                 except Exception:
                     pass
                 ws = None
-            if consecutive_errors >= 5:
-                time.sleep(1.0)
+            if consecutive_errors >= 3:
+                time.sleep(min(0.5 * consecutive_errors, 3.0))
         time.sleep(FRAME_INTERVAL)
-
 
 def open_camera():
     if not CV2_AVAILABLE:
@@ -913,10 +951,12 @@ def handle_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def platform_info() -> dict[str, Any]:
+    shell_name = "CMD" if IS_WINDOWS else ("Terminal / zsh" if IS_MACOS else "Terminal / bash")
     info: dict[str, Any] = {
         "platform": platform.system(),
         "release": platform.release(),
         "machine": platform.machine(),
+        "shell": shell_name,
     }
     try:
         x, y, w, h = _screen_primary_bbox()
@@ -938,7 +978,15 @@ def telemetry() -> tuple[float | None, float | None]:
 def client_loop():
     global STREAMING_SCREEN, STREAMING_CAMERA, STOP
 
+    backoff = OFFLINE_BACKOFF_MIN
     while not STOP:
+        if not _network_available():
+            STREAMING_SCREEN = False
+            STREAMING_CAMERA = False
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, OFFLINE_BACKOFF_MAX)
+            continue
+
         try:
             caps = ["screen", "files", "platform"]
             if mss is not None or ImageGrab is not None:
@@ -967,6 +1015,7 @@ def client_loop():
                 timeout=4,
             )
 
+            backoff = OFFLINE_BACKOFF_MIN
             STREAMING_SCREEN = bool(res.get("stream_screen"))
             STREAMING_CAMERA = bool(res.get("stream_camera"))
 
@@ -985,12 +1034,14 @@ def client_loop():
                 except Exception:
                     pass
 
-        except Exception as exc:
+        except Exception:
             STREAMING_SCREEN = False
             STREAMING_CAMERA = False
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, OFFLINE_BACKOFF_MAX)
+            continue
 
         time.sleep(HEARTBEAT_INTERVAL)
-
 
 def main():
     global STOP
