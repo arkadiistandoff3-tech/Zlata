@@ -1,5 +1,8 @@
-requests
-psutil
-pillow
-opencv-python
-pyautogui
+requests>=2.32,<3
+Pillow>=10,<13
+mss>=10,<11
+websocket-client>=1.8,<2
+opencv-python>=4.10,<5
+pyautogui>=0.9,<1
+pyperclip>=1.9,<2
+psutil>=6,<8
