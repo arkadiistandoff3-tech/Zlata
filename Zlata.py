@@ -525,10 +525,17 @@ TROLL_FUNCS = {
  "almost":troll_almost
 }
 # --- Flask app ---
-app = Flask(__name__)
+# Reuse the single Flask instance created above. Creating a second instance here
+# would drop routes registered earlier in this module when Gunicorn imports it.
 app.secret_key = SECRET_KEY
 
 # WebSocket transport for low-latency screen frames. HTTP/MJPEG stays as a fallback.
+# Flask-Sock supports Gunicorn gthread workers; the deployment bundle pins the
+# app to one worker because REMOTE_CLIENTS/jobs are intentionally in-process.
+app.config.setdefault("SOCK_SERVER_OPTIONS", {
+    "ping_interval": 25,
+    "max_message_size": 4 * 1024 * 1024,
+})
 SOCK = None
 if FLASK_SOCK_AVAILABLE:
     try:
@@ -4250,7 +4257,8 @@ def _remote_heartbeat():
             "screen_seq": 0, "camera_seq": 0, "ws_screen_clients": 0,
         })
         c["name"] = data.get("name") or c["name"]
-        c["ip"] = request.remote_addr or c["ip"]
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        c["ip"] = forwarded or request.remote_addr or c["ip"]
         c["caps"] = list(data.get("caps") or [])
         c["last_seen"] = time.time()
         c["cpu"] = data.get("cpu", c.get("cpu"))
@@ -4498,8 +4506,18 @@ def _permission(p: str) -> bool:
     return p in load_users().get(u, {}).get("permissions", [])
 
 def _adapt_api_volume():
-    # z16 currently has no volume job; preserve the z15 UI endpoint.
-    return jsonify(value=50, ok=True) if request.method == "GET" else (jsonify(ok=False, error="volume control is not in current z16 client"), 409)
+    if not has_remote_permission():
+        return jsonify(ok=False, error="no access"), 403
+    if request.method == "GET":
+        # The current z16 client can set volume, but does not expose a reliable
+        # read-back API. Return an explicit unknown value rather than pretending.
+        return jsonify(ok=True, value=None, supported=True)
+    data = _json_body()
+    try:
+        value = max(0, min(100, int(float(data.get("value", 50)))))
+    except Exception:
+        return jsonify(ok=False, error="invalid volume"), 400
+    return jsonify(_job_sync("volume", timeout=10, value=value))
 
 def _adapt_troll_toggle():
     if not has_remote_permission():
@@ -4534,8 +4552,16 @@ def _adapt_sys_action():
     if not has_remote_permission():
         flash("No remote permission")
         return redirect(url_for("index"))
-    action = request.form.get("action", "")
-    flash(f"System action '{action}' requires a matching z16 job in the client build.")
+    action = request.form.get("action", "").strip().lower()
+    allowed = {"shutdown", "restart", "sleep", "logout"}
+    if action not in allowed:
+        flash("Unsupported system action")
+        return redirect(url_for("index"))
+    result = _job_sync("system_action", timeout=10, action=action)
+    if result.get("ok"):
+        flash(f"{action}: command sent to selected PC")
+    else:
+        flash(result.get("error", "system action failed"))
     return redirect(url_for("index"))
 
 def _adapt_run_cmd_route():
@@ -4792,7 +4818,9 @@ app.jinja_env.globals.update(THEMES=THEMES, TROLLS=TROLLS)
 # Health check for Render.
 @app.get("/healthz")
 def healthz():
-    return jsonify(ok=True, clients=sum(1 for c in REMOTE_CLIENTS.values() if _client_online(c)))
+    with REMOTE_LOCK:
+        online_clients = sum(1 for c in REMOTE_CLIENTS.values() if _client_online(c))
+    return jsonify(ok=True, clients=online_clients)
 
 if __name__ == "__main__":
     load_users()
@@ -4800,6 +4828,7 @@ if __name__ == "__main__":
     except Exception: pass
     try: load_chat()
     except Exception: pass
+    # Local development fallback only. Production/Render should use Gunicorn.
     app.run(host=HOST, port=PORT, threaded=True)
 
 # Compatibility alias for older z15 templates that reference select_client_route.
